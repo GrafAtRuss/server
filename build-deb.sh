@@ -5,7 +5,7 @@ STAGE=$(mktemp -d)
 VERSION=1.1.0
 NAME=onec-console
 DEST="$STAGE/${NAME}_${VERSION}_all"
-OUT=${1:-/workspace/artifacts/${NAME}_${VERSION}_all.deb}
+OUT=${1:-$ROOT/${NAME}_${VERSION}_all.deb}
 
 mkdir -p "$DEST/DEBIAN" \
   "$DEST/usr/lib/onec-console" \
