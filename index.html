@@ -127,7 +127,7 @@
   <div id="boot" class="login"><p class="muted mono">Открываем консоль…</p></div>
   <form id="login" class="login hidden">
     <div class="card">
-      <p class="eyebrow">1.2.9</p>
+      <p class="eyebrow">1.2.10</p>
       <h1 style="margin-top:12px">Консоль платформы</h1>
       <label class="lbl" for="login-name">Логин</label>
       <input id="login-name" autocomplete="username" style="margin-top:8px" />
@@ -140,7 +140,7 @@
   <div id="app" class="shell hidden">
     <aside>
       <div>
-        <p class="eyebrow" style="color:var(--rail-dim)">1.2.9</p>
+        <p class="eyebrow" style="color:var(--rail-dim)">1.2.10</p>
         <p style="margin:4px 0 0;font-size:18px;font-weight:600">Консоль платформы</p>
       </div>
       <nav class="nav" style="overflow:auto">
@@ -448,7 +448,17 @@
         const chosen = (state.chosenBases || []).filter((base) => base.sourceId === item.id).map((base) => `<div style="margin-top:12px"><b>${esc(base.name)}</b> <button class="ghost" type="button" data-drop="chosen:${base.id}" data-kind="base">Убрать</button>${jobsOf("base", base.id).map(jobHtml).join("")}${jobForm(base.id, "base")}</div>`).join("");
         return `${row(item, "clusters")}<p class="mono muted">${item.host}:${item.port}</p><div class="stack"><button class="ghost" type="button" data-catalog="clusters" data-id="${item.id}">Обновить список</button><select data-pick="${item.id}">${options}</select><button class="dark" type="button" data-take="base" data-source="${item.id}">Взять в работу</button></div>${chosen}`;
       }).join("") || "<p class='muted'>Серверы баз не подключены.</p>";
-      $("users").innerHTML = state.users.map((user) => `<li style="display:flex;justify-content:space-between;gap:12px;padding:12px 0;border-bottom:1px solid var(--line)"><span>${user.name}<br><span class="mono muted">${user.login}</span></span>${user.login === state.me.login ? "<span class='muted'>это вы</span>" : `<button class="ghost" data-remove="${user.login}" type="button">Удалить</button>`}</li>`).join("");
+      $("users").innerHTML = state.users.map((user) => {
+        const self = user.login === state.me.login;
+        const blocked = user.blocked ? "1" : "0";
+        return `<li style="display:flex;flex-wrap:wrap;align-items:center;gap:8px;padding:12px 0;border-bottom:1px solid var(--line)">
+          <input data-user-name="${esc(user.login)}" value="${esc(user.name)}" placeholder="Имя" style="flex:1;min-width:140px" />
+          <input data-user-login="${esc(user.login)}" value="${esc(user.login)}" placeholder="Логин" style="flex:1;min-width:140px" />
+          <button class="ghost" type="button" data-save-user="${esc(user.login)}" data-was-blocked="${blocked}">Сохранить</button>
+          ${self ? `<span class="muted">это вы</span>` : `<button class="ghost" type="button" data-block="${esc(user.login)}" data-blocked="${blocked}">${user.blocked ? "Разблокировать" : "Заблокировать"}</button><button class="ghost" type="button" data-remove="${esc(user.login)}">Удалить</button>`}
+          ${user.blocked ? `<span class="muted">заблокирован</span>` : ""}
+        </li>`;
+      }).join("");
     }
 
     async function refresh() {
@@ -493,7 +503,7 @@
           service: "Перезагрузка, выключение и обновление с GitHub.",
           about: "Описание читается из README.md на GitHub.",
           changelog: "История версий читается из CHANGELOG.md на GitHub.",
-          access: "Несколько операторов. Каждый меняет только свой пароль."
+          access: "Имя и логин можно изменить. Чужую учётную запись можно заблокировать."
         };
         const tab = button.dataset.tab;
         ["platform", "bases", "storages", "vms", "system", "service", "about", "changelog", "access"].forEach((name) => {
@@ -591,10 +601,30 @@
     });
 
     $("users").addEventListener("click", async (event) => {
-      const login = event.target.dataset.remove;
-      if (!login) return;
-      await api("/api/operators?login=" + encodeURIComponent(login), { method: "DELETE" });
-      await refresh();
+      const remove = event.target.dataset.remove;
+      if (remove) {
+        await api("/api/operators?login=" + encodeURIComponent(remove), { method: "DELETE" });
+        await refresh();
+        return;
+      }
+      const save = event.target.dataset.saveUser;
+      const block = event.target.dataset.block;
+      const key = save || block;
+      if (!key) return;
+      const name = document.querySelector(`[data-user-name="${key}"]`).value;
+      const newLogin = document.querySelector(`[data-user-login="${key}"]`).value;
+      const blocked = block ? event.target.dataset.blocked !== "1" : event.target.dataset.wasBlocked === "1";
+      try {
+        await api("/api/operators/update", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ login: key, newLogin, name, blocked })
+        });
+        $("access-msg").textContent = block ? (blocked ? "Пользователь заблокирован." : "Пользователь разблокирован.") : "Пользователь сохранён.";
+        await refresh();
+      } catch (error) {
+        $("access-msg").textContent = error.message;
+      }
     });
 
     async function send(url, body) {

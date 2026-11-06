@@ -4,6 +4,7 @@
 import hashlib
 import json
 import os
+import re
 import secrets
 import shutil
 import subprocess
@@ -31,7 +32,8 @@ from hostadmin import (
 )
 from ops import deliver, list_storage, probe, public_copy, run_vm, schedule_due
 
-PRODUCT_VERSION = "1.2.9"
+PRODUCT_VERSION = "1.2.10"
+LOGIN_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
 
 STATE_DIR = Path(os.environ.get("ONEC_STATE_DIR", "/var/lib/onec-console"))
 CACHE_DIR = Path(os.environ.get("ONEC_CACHE_DIR", "/var/cache/onec-platform"))
@@ -125,6 +127,7 @@ def ensure_admin() -> None:
                 "salt": salt,
                 "passHash": pbkdf2(password, salt),
                 "mustChange": True,
+                "blocked": False,
             }
         )
         save_state(state)
@@ -248,6 +251,9 @@ class Handler(BaseHTTPRequestHandler):
         if not user:
             self._send(401, {"error": "Нужен вход."})
             return None
+        if user.get("blocked"):
+            self._send(401, {"error": "Учётная запись заблокирована."})
+            return None
         return user
 
     def do_GET(self) -> None:
@@ -267,7 +273,7 @@ class Handler(BaseHTTPRequestHandler):
             if not user:
                 return
             public_users = [
-                {"login": item["login"], "name": item["name"], "mustChange": item["mustChange"]}
+                {"login": item["login"], "name": item["name"], "mustChange": item["mustChange"], "blocked": bool(item.get("blocked"))}
                 for item in state["users"]
             ]
             archives = {
@@ -343,6 +349,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/operators":
             self._add_operator(state)
+            return
+        if path == "/api/operators/update":
+            self._update_operator(user)
             return
         if path == "/api/archive":
             self._upload(state)
@@ -463,6 +472,9 @@ class Handler(BaseHTTPRequestHandler):
             if not found or found["passHash"] != pbkdf2(password, found["salt"]):
                 self._send(401, {"error": "Неверный логин или пароль."})
                 return
+            if found.get("blocked"):
+                self._send(403, {"error": "Учётная запись заблокирована."})
+                return
             token = secrets.token_urlsafe(32)
             state["sessions"][token] = found["login"]
             save_state(state)
@@ -519,15 +531,15 @@ class Handler(BaseHTTPRequestHandler):
         login = str(payload.get("login", "")).strip().lower()
         name = str(payload.get("name", "")).strip()
         password = str(payload.get("password", ""))
-        if not login or not name or len(password) < 8:
-            self._send(400, {"error": "Логин, имя и пароль от 8 символов."})
+        if not LOGIN_RE.fullmatch(login) or not name or len(password) < 8:
+            self._send(400, {"error": "Логин — латиница, цифры, точка или дефис. Имя и пароль от 8 символов."})
             return
         if any(item["login"] == login for item in state["users"]):
             self._send(400, {"error": "Такой логин уже есть."})
             return
         salt = secrets.token_hex(16)
         state["users"].append(
-            {"login": login, "name": name, "salt": salt, "passHash": pbkdf2(password, salt), "mustChange": False}
+            {"login": login, "name": name, "salt": salt, "passHash": pbkdf2(password, salt), "mustChange": False, "blocked": False}
         )
         with LOCK:
             fresh = load_state()
@@ -535,6 +547,48 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(400, {"error": "Такой логин уже есть."})
                 return
             fresh["users"].append(state["users"][-1])
+            save_state(fresh)
+        self._send(200, {"ok": True})
+
+    def _update_operator(self, actor) -> None:
+        try:
+            payload = self._read_json()
+        except ValueError as error:
+            self._send(400, {"error": str(error)})
+            return
+        old = str(payload.get("login", "")).strip().lower()
+        new_login = str(payload.get("newLogin", old)).strip().lower()
+        name = str(payload.get("name", "")).strip()
+        blocked = bool(payload.get("blocked"))
+        if not name or not LOGIN_RE.fullmatch(new_login or ""):
+            self._send(400, {"error": "Имя не пустое, логин — латиница, цифры, точка, дефис."})
+            return
+        with LOCK:
+            fresh = load_state()
+            found = next((item for item in fresh["users"] if item["login"] == old), None)
+            if not found:
+                self._send(404, {"error": "Пользователь не найден."})
+                return
+            if new_login != old and any(item["login"] == new_login for item in fresh["users"]):
+                self._send(400, {"error": "Такой логин уже есть."})
+                return
+            if blocked and old == actor["login"]:
+                self._send(400, {"error": "Нельзя заблокировать свою учётную запись."})
+                return
+            others = [item for item in fresh["users"] if item["login"] != old and not item.get("blocked")]
+            if blocked and not others:
+                self._send(400, {"error": "Нужна хотя бы одна действующая учётная запись."})
+                return
+            found["name"] = name
+            found["blocked"] = blocked
+            found["login"] = new_login
+            sessions = {}
+            for token, who in fresh["sessions"].items():
+                if who != old:
+                    sessions[token] = who
+                elif not blocked:
+                    sessions[token] = new_login
+            fresh["sessions"] = sessions
             save_state(fresh)
         self._send(200, {"ok": True})
 
