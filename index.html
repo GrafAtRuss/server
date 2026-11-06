@@ -1,0 +1,545 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Консоль платформы 1С</title>
+  <style>
+    :root {
+      --paper: #f3efe6;
+      --card: #fbf8f2;
+      --ink: #1a1814;
+      --muted: #6f675c;
+      --line: #e2dacd;
+      --copper: #b85a2a;
+      --copper-ink: #fff7f2;
+      --pine: #1d6a43;
+      --pine-soft: #e6f3eb;
+      --sand: #f6edd6;
+      --rail: #221e1a;
+      --rail-fg: #f4efe6;
+      --rail-dim: #b7aea2;
+      --danger: #8d2e2e;
+    }
+    * { box-sizing: border-box; }
+    html { -webkit-font-smoothing: antialiased; }
+    body {
+      margin: 0;
+      background: var(--paper);
+      color: var(--ink);
+      font: 16px/1.45 "Segoe UI", "Noto Sans", "DejaVu Sans", sans-serif;
+    }
+    button, label.file { cursor: pointer; }
+    button { font: inherit; }
+    h1 { text-wrap: balance; font-size: 1.7rem; margin: 0; }
+    input, select {
+      height: 48px;
+      width: 100%;
+      border: 1px solid var(--line);
+      background: var(--paper);
+      border-radius: 12px;
+      padding: 0 12px;
+      font: inherit;
+      color: inherit;
+    }
+    .login {
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      padding: 24px 16px;
+    }
+    .card {
+      width: min(440px, 100%);
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      padding: 32px;
+    }
+    .eyebrow { font-family: ui-monospace, monospace; font-size: 12px; letter-spacing: 0.14em; text-transform: uppercase; color: var(--copper); }
+    .muted { color: var(--muted); }
+    .danger { color: var(--danger); }
+    .primary, .dark {
+      height: 48px;
+      border: 0;
+      border-radius: 12px;
+      padding: 0 18px;
+      font-weight: 500;
+    }
+    .primary { background: var(--copper); color: var(--copper-ink); }
+    .dark { background: var(--ink); color: var(--paper); }
+    .ghost { height: 40px; border: 1px solid var(--line); background: transparent; border-radius: 10px; padding: 0 12px; }
+    .shell { min-height: 100vh; }
+    @media (min-width: 960px) {
+      .shell { display: grid; grid-template-columns: 240px 1fr; }
+    }
+    aside {
+      background: var(--rail);
+      color: var(--rail-fg);
+      padding: 16px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+    }
+    @media (min-width: 960px) {
+      aside { display: flex; flex-direction: column; align-items: stretch; padding: 28px 20px; }
+      .nav { margin-top: 28px; display: flex; flex-direction: column; gap: 8px; }
+      .who { margin-top: auto; }
+    }
+    .nav { display: flex; gap: 8px; }
+    .nav button { height: 44px; border: 0; border-radius: 12px; background: transparent; color: var(--rail-dim); padding: 0 12px; text-align: left; }
+    .nav button.on { background: var(--copper); color: var(--copper-ink); }
+    main { padding: 24px 16px 40px; }
+    @media (min-width: 700px) { main { padding: 32px; } }
+    .head { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 12px; align-items: end; }
+    .pill { height: 36px; display: inline-flex; align-items: center; border-radius: 999px; padding: 0 12px; font-size: 14px; }
+    .pill.wait { border: 1px solid var(--line); background: var(--card); color: var(--muted); }
+    .pill.ok { background: var(--pine-soft); color: var(--pine); }
+    .grid { display: grid; gap: 16px; margin-top: 20px; }
+    @media (min-width: 1100px) { .split { grid-template-columns: 1fr 320px; } }
+    .panel { background: var(--card); border: 1px solid var(--line); border-radius: 16px; padding: 20px; }
+    .archives { display: grid; gap: 12px; }
+    @media (min-width: 700px) { .archives { grid-template-columns: 1fr 1fr; } }
+    .slot { background: var(--paper); border: 1px solid var(--line); border-radius: 12px; padding: 16px; }
+    .mono { font-family: ui-monospace, monospace; font-size: 12px; }
+    ol { list-style: none; margin: 16px 0; padding: 0; border-top: 1px solid var(--line); }
+    li.step { display: flex; gap: 10px; padding: 12px 0; border-bottom: 1px solid var(--line); }
+    pre.log {
+      margin: 12px 0 0;
+      min-height: 320px;
+      max-height: 420px;
+      overflow: auto;
+      white-space: pre-wrap;
+      background: var(--rail);
+      color: var(--rail-fg);
+      border-radius: 16px;
+      padding: 16px;
+      font: 12px/1.55 ui-monospace, monospace;
+    }
+    .forms { display: grid; gap: 16px; }
+    @media (min-width: 900px) { .forms { grid-template-columns: 1fr 1fr; } }
+    .stack { display: grid; gap: 12px; margin-top: 16px; }
+    .hidden { display: none; }
+    label.lbl { display: block; font-size: 14px; font-weight: 500; margin-top: 16px; }
+  </style>
+</head>
+<body>
+  <div id="boot" class="login"><p class="muted mono">Открываем консоль…</p></div>
+  <form id="login" class="login hidden">
+    <div class="card">
+      <p class="eyebrow">1.1.0</p>
+      <h1 style="margin-top:12px">Консоль платформы</h1>
+      <label class="lbl" for="login-name">Логин</label>
+      <input id="login-name" autocomplete="username" style="margin-top:8px" />
+      <label class="lbl" for="login-pass">Пароль</label>
+      <input id="login-pass" type="password" autocomplete="current-password" style="margin-top:8px" />
+      <p id="login-error" class="danger"></p>
+      <button class="primary" style="width:100%;margin-top:20px" type="submit">Войти</button>
+    </div>
+  </form>
+  <div id="app" class="shell hidden">
+    <aside>
+      <div>
+        <p class="eyebrow" style="color:var(--rail-dim)">1.1.0</p>
+        <p style="margin:4px 0 0;font-size:18px;font-weight:600">Консоль 1С</p>
+      </div>
+      <nav class="nav">
+        <button type="button" data-tab="platform" class="on">Установка</button>
+        <button type="button" data-tab="bases">Базы</button>
+        <button type="button" data-tab="storages">Хранилища</button>
+        <button type="button" data-tab="vms">Виртмашины</button>
+        <button type="button" data-tab="access">Доступ</button>
+      </nav>
+      <div class="who">
+        <p id="who-name" style="margin:0"></p>
+        <p id="who-login" class="mono" style="color:var(--rail-dim);margin:4px 0 0"></p>
+        <button id="logout" type="button" style="margin-top:12px;background:none;border:0;color:var(--rail-dim)">Выйти</button>
+      </div>
+    </aside>
+    <main>
+      <div class="head">
+        <div>
+          <h1 id="title">Установка платформы</h1>
+          <p id="lead" class="muted">Архивы сервера и клиента разбираются сами. Пакеты ставятся в порядке зависимостей.</p>
+          <p id="form-error" class="danger"></p>
+        </div>
+        <span id="pill" class="pill wait">Платформа не установлена</span>
+      </div>
+      <section id="tab-platform" class="grid split">
+        <div class="panel">
+          <div class="archives">
+            <div class="slot">
+              <strong>Сервер</strong>
+              <p id="server-name" class="mono muted">архив не загружен</p>
+              <label class="file ghost">Загрузить архив<input id="server-file" type="file" accept=".zip,application/zip" hidden /></label>
+            </div>
+            <div class="slot">
+              <strong>Клиент</strong>
+              <p id="client-name" class="mono muted">архив не загружен</p>
+              <label class="file ghost">Загрузить архив<input id="client-file" type="file" accept=".zip,application/zip" hidden /></label>
+            </div>
+          </div>
+          <p id="plan-error" class="danger"></p>
+          <ol id="plan"></ol>
+          <button id="install" class="primary" type="button">Установить автоматически</button>
+          <p id="done" class="hidden" style="color:var(--pine)"></p>
+        </div>
+        <pre id="log" class="log">Ожидание запуска. Порядок: common → server → client.</pre>
+      </section>
+      <section id="tab-storages" class="hidden grid">
+        <form id="disk-form" class="panel" data-role="disk">
+          <strong>Диски для хранения</strong>
+          <p class="muted">Сюда пишутся бекапы и отсюда с ними работают.</p>
+          <div class="stack">
+            <select name="kind"><option value="webdav">WebDAV</option><option value="cifs">CIFS</option><option value="nfs">NFS</option><option value="ftp">FTP</option></select>
+            <input name="name" placeholder="Имя" />
+            <input name="endpoint" placeholder="Адрес, URL или //сервер/каталог" />
+            <input name="login" placeholder="Логин" />
+            <input name="secret" type="password" placeholder="Пароль" />
+            <button class="primary" type="submit">Подключить</button>
+          </div>
+          <ul id="disk-list" style="list-style:none;padding:0"></ul>
+        </form>
+        <form id="cloud-form" class="panel" data-role="cloud">
+          <strong>Облака для копии</strong>
+          <p class="muted">После записи на диск копия уходит в выбранные облака.</p>
+          <div class="stack">
+            <select name="kind"><option value="google">Google Drive</option><option value="yandex">Яндекс Диск</option><option value="mail">Облако Mail.ru</option></select>
+            <input name="name" placeholder="Имя" />
+            <input name="endpoint" placeholder="Каталог или идентификатор" />
+            <input name="login" placeholder="Аккаунт, если нужен" />
+            <input name="secret" type="password" placeholder="Токен или пароль приложения" />
+            <button class="primary" type="submit">Подключить</button>
+          </div>
+          <ul id="cloud-list" style="list-style:none;padding:0"></ul>
+        </form>
+      </section>
+      <section id="tab-vms" class="hidden grid">
+        <form id="host-form" class="panel">
+          <strong>Гипервизор</strong>
+          <div class="stack">
+            <select name="kind"><option value="esxi">ESXi</option><option value="vsphere">vSphere</option></select>
+            <input name="name" placeholder="Имя подключения" />
+            <input name="host" placeholder="esxi.example или vcenter.example" />
+            <input name="login" placeholder="Логин" />
+            <input name="secret" type="password" placeholder="Пароль" />
+            <button class="dark" type="submit">Подключить</button>
+          </div>
+          <ul id="host-list" style="list-style:none;padding:0"></ul>
+        </form>
+        <form id="job-form" class="panel">
+          <strong>Бекап машины</strong>
+          <p class="muted">Перед копированием машина мягко выключается, после копии включается.</p>
+          <div class="stack">
+            <select id="job-host" name="hostId"></select>
+            <input name="vmName" placeholder="Имя виртуальной машины" />
+            <select id="job-disk" name="storageId"></select>
+            <input name="time" type="time" value="02:00" />
+            <label class="lbl"><input id="job-enabled" type="checkbox" /> По расписанию, будни</label>
+            <button class="primary" type="submit">Добавить бекап</button>
+          </div>
+          <ul id="job-list" style="list-style:none;padding:0"></ul>
+        </form>
+        <pre id="vm-log" class="log">Журнал выключения, копии и включения появится здесь.</pre>
+      </section>
+      <section id="tab-bases" class="hidden">
+        <form id="base-form" class="panel">
+          <strong>Информационная база</strong>
+          <div class="stack">
+            <input name="name" placeholder="Имя базы" />
+            <select name="kind"><option value="server">Серверная</option><option value="file">Файловая</option></select>
+            <input name="target" placeholder="localhost\trade или путь к файловой базе" />
+            <select id="base-disk" name="storageId"></select>
+            <input name="time" type="time" value="02:00" />
+            <label class="lbl"><input id="base-enabled" type="checkbox" /> По расписанию, будни</label>
+            <button class="dark" type="submit">Добавить базу</button>
+          </div>
+          <ul id="base-list" style="list-style:none;padding:0"></ul>
+        </form>
+      </section>
+      <section id="tab-access" class="hidden">
+        <div class="forms">
+          <form id="pass-form" class="panel">
+            <strong>Сменить свой пароль</strong>
+            <p id="must" class="hidden" style="background:var(--sand);padding:8px 12px;border-radius:12px">Пароль ещё не сменён.</p>
+            <input id="cur-pass" type="password" placeholder="Текущий пароль" style="margin-top:16px" />
+            <input id="new-pass" type="password" placeholder="Новый пароль" style="margin-top:12px" />
+            <button class="primary" style="margin-top:16px" type="submit">Сохранить пароль</button>
+          </form>
+          <form id="op-form" class="panel">
+            <strong>Новый оператор</strong>
+            <input id="op-name" placeholder="Имя" style="margin-top:16px" />
+            <input id="op-login" placeholder="Логин" style="margin-top:12px" />
+            <input id="op-pass" type="password" placeholder="Пароль" style="margin-top:12px" />
+            <button class="dark" style="margin-top:16px" type="submit">Добавить</button>
+          </form>
+        </div>
+        <p id="access-msg"></p>
+        <ul id="users" class="panel" style="list-style:none;padding:0 20px;margin-top:16px"></ul>
+      </section>
+    </main>
+  </div>
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const ROLE = {
+      common: "Общие компоненты", "common-nls": "Общие, русский", server: "Сервер 1С",
+      "server-nls": "Сервер, русский", client: "Толстый клиент", "client-nls": "Клиент, русский",
+      "thin-client": "Тонкий клиент", "thin-client-nls": "Тонкий клиент, русский",
+      ws: "Веб-модуль", "ws-nls": "Веб-модуль, русский", crs: "Хранилище"
+    };
+    let me = null;
+
+    async function api(url, options) {
+      const response = await fetch(url, { credentials: "same-origin", ...options });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(data.error || "Ошибка запроса");
+      return data;
+    }
+
+    function show(name) {
+      $("boot").classList.add("hidden");
+      $("login").classList.toggle("hidden", name !== "login");
+      $("app").classList.toggle("hidden", name !== "app");
+    }
+
+    function render(state) {
+      me = state.me;
+      show("app");
+      $("who-name").textContent = state.me.name;
+      $("who-login").textContent = state.me.login;
+      $("must").classList.toggle("hidden", !state.me.mustChange);
+      const server = state.archives.server;
+      const client = state.archives.client;
+      $("server-name").textContent = server ? server.fileName + " · " + server.count : "архив не загружен";
+      $("client-name").textContent = client ? client.fileName + " · " + client.count : "архив не загружен";
+      $("plan-error").textContent = state.plan.error || "";
+      $("plan").innerHTML = (state.plan.steps || []).map((step) => {
+        const skip = step.action === "skip";
+        return `<li class="step"><span style="color:${skip ? "var(--muted)" : "var(--pine)"}">${skip ? "–" : "✓"}</span><div><div>${ROLE[step.role] || step.role} <span class="muted">${skip ? "пропуск" : "установить"}</span></div><div class="mono muted">${step.fileName}</div></div></li>`;
+      }).join("");
+      $("install").disabled = Boolean(state.plan.error) || !(state.plan.steps || []).length;
+      if (state.installed) {
+        $("pill").className = "pill ok";
+        $("pill").textContent = state.installed.version;
+        $("done").classList.remove("hidden");
+        $("done").textContent = "Установлено. Конфигуратор: " + state.installed.binary;
+      }
+      $("log").textContent = (state.log || []).join("\n") || "Ожидание запуска. Порядок: common → server → client.";
+      const disks = (state.storages || []).filter((item) => item.role === "disk");
+      const clouds = (state.storages || []).filter((item) => item.role === "cloud");
+      const row = (item, action) => `<li style="display:flex;justify-content:space-between;gap:12px;padding:10px 0;border-bottom:1px solid var(--line)"><span>${item.name}<br><span class="mono muted">${item.detail || item.host || item.endpoint || ""}</span></span><button class="ghost" type="button" data-drop="${action}:${item.id}">Удалить</button></li>`;
+      $("disk-list").innerHTML = disks.map((item) => row(item, "storages")).join("") || "<li class='muted'>Пока ничего не подключено.</li>";
+      $("cloud-list").innerHTML = clouds.map((item) => row(item, "storages")).join("") || "<li class='muted'>Пока ничего не подключено.</li>";
+      $("host-list").innerHTML = (state.hosts || []).map((item) => row(item, "hosts")).join("") || "<li class='muted'>Гипервизоры не подключены.</li>";
+      $("job-host").innerHTML = "<option value=''>Гипервизор</option>" + (state.hosts || []).map((item) => `<option value="${item.id}">${item.name}</option>`).join("");
+      $("job-disk").innerHTML = "<option value=''>Диск для бекапа</option>" + disks.map((item) => `<option value="${item.id}">${item.name}</option>`).join("");
+      $("base-disk").innerHTML = $("job-disk").innerHTML;
+      $("job-list").innerHTML = (state.jobs || []).map((job) => `<li style="padding:10px 0;border-bottom:1px solid var(--line)"><b>${job.vmName}</b> <span class="muted">${job.schedule && job.schedule.enabled ? job.schedule.time : "без расписания"}</span> <button class="ghost" type="button" data-run="${job.id}">Запустить</button> <button class="ghost" type="button" data-drop="jobs:${job.id}">Удалить</button></li>`).join("");
+      $("base-list").innerHTML = (state.bases || []).map((base) => `<li style="padding:10px 0;border-bottom:1px solid var(--line)"><b>${base.name}</b> <span class="muted">${base.schedule && base.schedule.enabled ? base.schedule.time : "без расписания"}</span> <button class="ghost" type="button" data-drop="bases:${base.id}">Удалить</button></li>`).join("");
+      $("users").innerHTML = state.users.map((user) => `<li style="display:flex;justify-content:space-between;gap:12px;padding:12px 0;border-bottom:1px solid var(--line)"><span>${user.name}<br><span class="mono muted">${user.login}</span></span>${user.login === state.me.login ? "<span class='muted'>это вы</span>" : `<button class="ghost" data-remove="${user.login}" type="button">Удалить</button>`}</li>`).join("");
+    }
+
+    async function refresh() {
+      try {
+        render(await api("/api/state"));
+      } catch {
+        show("login");
+      }
+    }
+
+    $("login").addEventListener("submit", async (event) => {
+      event.preventDefault();
+      $("login-error").textContent = "";
+      try {
+        await api("/api/login", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ login: $("login-name").value, password: $("login-pass").value })
+        });
+        $("login-pass").value = "";
+        await refresh();
+      } catch (error) {
+        $("login-error").textContent = error.message;
+      }
+    });
+
+    document.querySelectorAll("[data-tab]").forEach((button) => {
+      button.addEventListener("click", () => {
+        document.querySelectorAll("[data-tab]").forEach((item) => item.classList.toggle("on", item === button));
+        const titles = { platform: "Установка платформы", bases: "Информационные базы", storages: "Хранилища", vms: "Виртуальные машины", access: "Операторы" };
+        const leads = {
+          platform: "Архивы сервера и клиента разбираются сами. Пакеты ставятся в порядке зависимостей.",
+          bases: "У каждой базы своё расписание, диск и облачные копии.",
+          storages: "Диски хранят бекапы. Облака получают дополнительную копию.",
+          vms: "Машина мягко выключается, копируется и снова включается.",
+          access: "Несколько операторов. Каждый меняет только свой пароль."
+        };
+        const tab = button.dataset.tab;
+        ["platform", "bases", "storages", "vms", "access"].forEach((name) => {
+          $("tab-" + name).classList.toggle("hidden", name !== tab);
+        });
+        $("title").textContent = titles[tab];
+        $("lead").textContent = leads[tab];
+      });
+    });
+
+    $("logout").addEventListener("click", async () => {
+      await api("/api/logout", { method: "POST" });
+      show("login");
+    });
+
+    async function upload(kind, file) {
+      $("plan-error").textContent = "";
+      try {
+        await api("/api/archive?kind=" + kind, {
+          method: "POST",
+          headers: { "X-Filename": file.name, "Content-Type": "application/octet-stream" },
+          body: file
+        });
+        await refresh();
+      } catch (error) {
+        $("plan-error").textContent = error.message;
+      }
+    }
+    $("server-file").addEventListener("change", (event) => {
+      const file = event.target.files[0];
+      if (file) upload("server", file);
+      event.target.value = "";
+    });
+    $("client-file").addEventListener("change", (event) => {
+      const file = event.target.files[0];
+      if (file) upload("client", file);
+      event.target.value = "";
+    });
+
+    $("install").addEventListener("click", async () => {
+      $("install").disabled = true;
+      $("log").textContent = "Установка…";
+      try {
+        const result = await api("/api/install", { method: "POST" });
+        $("log").textContent = (result.log || []).join("\n");
+        await refresh();
+      } catch (error) {
+        $("plan-error").textContent = error.message;
+        $("install").disabled = false;
+      }
+    });
+
+    $("pass-form").addEventListener("submit", async (event) => {
+      event.preventDefault();
+      try {
+        await api("/api/password", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ current: $("cur-pass").value, password: $("new-pass").value })
+        });
+        $("cur-pass").value = "";
+        $("new-pass").value = "";
+        $("access-msg").textContent = "Пароль изменён.";
+        await refresh();
+      } catch (error) {
+        $("access-msg").textContent = error.message;
+      }
+    });
+
+    $("op-form").addEventListener("submit", async (event) => {
+      event.preventDefault();
+      try {
+        await api("/api/operators", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ name: $("op-name").value, login: $("op-login").value, password: $("op-pass").value })
+        });
+        $("op-name").value = "";
+        $("op-login").value = "";
+        $("op-pass").value = "";
+        $("access-msg").textContent = "Оператор добавлен.";
+        await refresh();
+      } catch (error) {
+        $("access-msg").textContent = error.message;
+      }
+    });
+
+    $("users").addEventListener("click", async (event) => {
+      const login = event.target.dataset.remove;
+      if (!login) return;
+      await api("/api/operators?login=" + encodeURIComponent(login), { method: "DELETE" });
+      await refresh();
+    });
+
+    async function send(url, body) {
+      $("form-error").textContent = "";
+      try {
+        return await api(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+      } catch (error) {
+        $("form-error").textContent = error.message;
+        throw error;
+      }
+    }
+
+    async function storageSubmit(event) {
+      event.preventDefault();
+      const form = event.target;
+      const body = Object.fromEntries(new FormData(form).entries());
+      body.role = form.dataset.role;
+      try {
+        await send("/api/storages", body);
+        form.reset();
+        await refresh();
+      } catch { /* shown */ }
+    }
+    $("disk-form").addEventListener("submit", storageSubmit);
+    $("cloud-form").addEventListener("submit", storageSubmit);
+
+    $("host-form").addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const body = Object.fromEntries(new FormData(event.target).entries());
+      try {
+        await send("/api/hosts", body);
+        event.target.reset();
+        await refresh();
+      } catch { /* shown */ }
+    });
+
+    $("job-form").addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const body = Object.fromEntries(new FormData(event.target).entries());
+      body.schedule = { enabled: $("job-enabled").checked, days: [0, 1, 2, 3, 4], time: body.time || "02:00" };
+      body.copyIds = [];
+      try {
+        await send("/api/jobs", body);
+        event.target.reset();
+        await refresh();
+      } catch { /* shown */ }
+    });
+
+    $("base-form").addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const body = Object.fromEntries(new FormData(event.target).entries());
+      body.schedule = { enabled: $("base-enabled").checked, days: [0, 1, 2, 3, 4], time: body.time || "02:00" };
+      body.copyIds = [];
+      try {
+        await send("/api/bases", body);
+        event.target.reset();
+        await refresh();
+      } catch { /* shown */ }
+    });
+
+    document.body.addEventListener("click", async (event) => {
+      const drop = event.target.dataset.drop;
+      if (drop) {
+        const [kind, id] = drop.split(":");
+        await api("/api/" + kind + "?id=" + encodeURIComponent(id), { method: "DELETE" });
+        await refresh();
+      }
+      const run = event.target.dataset.run;
+      if (run) {
+        const result = await send("/api/jobs/run", { id: run });
+        $("vm-log").textContent = (result.log || []).join("\n");
+      }
+    });
+
+    refresh();
+  </script>
+</body>
+</html>
