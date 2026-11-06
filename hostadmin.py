@@ -623,3 +623,94 @@ def new_stamp(folder: Path) -> Path:
     stamp = folder / datetime.now().strftime("%Y%m%d-%H%M%S")
     stamp.mkdir(parents=True, exist_ok=True)
     return stamp
+
+
+def sqlcmd_path() -> str:
+    for candidate in ("sqlcmd", "/opt/mssql-tools18/bin/sqlcmd", "/opt/mssql-tools/bin/sqlcmd"):
+        if candidate.startswith("/"):
+            if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+                return candidate
+            continue
+        found = shutil.which(candidate)
+        if found:
+            return found
+    raise RuntimeError("Не найден sqlcmd. Установите пакет mssql-tools18.")
+
+
+def sql_exec(server: dict, query: str, timeout: int = 60) -> str:
+    binary = sqlcmd_path()
+    env = os.environ.copy()
+    env["SQLCMDPASSWORD"] = str(server.get("secret", ""))
+    address = f"{server.get('host')},{server.get('port') or 1433}"
+    last = ""
+    for trust in (True, False):
+        args = [binary, "-S", address, "-U", str(server.get("login", "")), "-b", "-h", "-1", "-W"]
+        if trust:
+            args.append("-C")
+        args.extend(["-Q", query])
+        result = subprocess.run(args, text=True, capture_output=True, timeout=timeout, env=env, check=False)
+        last = (result.stderr or result.stdout or "").strip()
+        if result.returncode == 0:
+            return result.stdout
+        lowered = last.lower()
+        if trust and ("option" in lowered or "unknown" in lowered or "неизвест" in lowered):
+            continue
+        break
+    raise RuntimeError(last[:500] or "sqlcmd не выполнен")
+
+
+def sql_catalog(server: dict) -> list:
+    if os.environ.get("ONEC_SQL") == "skip":
+        return ["master", "trade"]
+    text = sql_exec(
+        server,
+        "SET NOCOUNT ON; SELECT name FROM sys.databases WHERE name <> 'tempdb' AND state = 0 ORDER BY name",
+    )
+    names = []
+    for line in text.splitlines():
+        name = line.strip()
+        if not name or name.startswith("(") or "affected" in name.lower():
+            continue
+        names.append(name)
+    return names
+
+
+def sql_ident(name: str) -> str:
+    return "[" + str(name).replace("]", "]]") + "]"
+
+
+def cifs_unc(endpoint: str, relative: str) -> str:
+    raw = str(endpoint).replace("\\", "/")
+    if raw.startswith("//"):
+        raw = raw[2:]
+    parts = [part for part in raw.split("/") if part]
+    extra = [part for part in str(relative).replace("\\", "/").split("/") if part not in ("", ".")]
+    return "\\\\" + "\\".join(parts + extra)
+
+
+def sql_target(server: dict, storage: dict, stamp: Path, file_name: str) -> str:
+    host = str(server.get("host", "")).strip().lower()
+    if storage.get("kind") == "cifs":
+        root = (MOUNT_ROOT / storage["id"]).resolve()
+        relative = stamp.resolve().relative_to(root).as_posix()
+        return cifs_unc(storage.get("endpoint", ""), relative) + "\\" + file_name
+    if host in ("localhost", "127.0.0.1", "::1"):
+        return str(stamp / file_name)
+    raise RuntimeError("Удалённый SQL Server записывает bak на диск CIFS. Подключите такой диск или укажите SQL на этой же машине.")
+
+
+def sql_backup(server: dict, database: str, storage: dict, stamp: Path) -> str:
+    file_name = safe_name(database) + ".bak"
+    if os.environ.get("ONEC_SQL") == "skip":
+        (stamp / file_name).write_text("sql\n", encoding="utf-8")
+        return f"бекап {database} → {stamp / file_name}"
+    target = sql_target(server, storage, stamp, file_name)
+    literal = target.replace("'", "''")
+    query = f"BACKUP DATABASE {sql_ident(database)} TO DISK = N'{literal}' WITH COPY_ONLY, INIT, COMPRESSION"
+    try:
+        sql_exec(server, query, timeout=7200)
+    except RuntimeError as error:
+        if "compression" not in str(error).lower():
+            raise
+        sql_exec(server, f"BACKUP DATABASE {sql_ident(database)} TO DISK = N'{literal}' WITH COPY_ONLY, INIT", timeout=7200)
+    return f"бекап {database} → {target}"

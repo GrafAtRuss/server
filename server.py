@@ -28,12 +28,14 @@ from hostadmin import (
     read_system,
     schedule_power,
     schedule_update,
+    sql_backup,
+    sql_catalog,
     update_offer,
     vm_catalog,
 )
 from ops import deliver, list_storage, probe, public_copy, run_vm, schedule_due
 
-PRODUCT_VERSION = "1.2.11"
+PRODUCT_VERSION = "1.2.12"
 LOGIN_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
 
 STATE_DIR = Path(os.environ.get("ONEC_STATE_DIR", "/var/lib/onec-console"))
@@ -87,6 +89,8 @@ def blank_state() -> dict:
         "clusters": [],
         "chosenBases": [],
         "chosenVms": [],
+        "sqlServers": [],
+        "chosenSql": [],
         "backupJobs": [],
     }
 
@@ -298,6 +302,8 @@ class Handler(BaseHTTPRequestHandler):
                     "clusters": public_copy(state["clusters"]),
                     "chosenBases": state["chosenBases"],
                     "chosenVms": state["chosenVms"],
+                    "sqlServers": public_copy(state["sqlServers"]),
+                    "chosenSql": state["chosenSql"],
                     "backupJobs": state["backupJobs"],
                 },
             )
@@ -398,6 +404,12 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/hosts/catalog":
             self._refresh_host()
             return
+        if path == "/api/sql":
+            self._add_sql()
+            return
+        if path == "/api/sql/catalog":
+            self._refresh_sql()
+            return
         if path == "/api/chosen":
             self._add_chosen()
             return
@@ -436,10 +448,20 @@ class Handler(BaseHTTPRequestHandler):
             item_id = query.get("id", [""])[0]
             state["clusters"] = [item for item in state["clusters"] if item["id"] != item_id]
             state["chosenBases"] = [item for item in state["chosenBases"] if item["sourceId"] != item_id]
+        elif parsed.path == "/api/sql":
+            item_id = query.get("id", [""])[0]
+            gone = {item["id"] for item in state["chosenSql"] if item["sourceId"] == item_id}
+            state["sqlServers"] = [item for item in state["sqlServers"] if item["id"] != item_id]
+            state["chosenSql"] = [item for item in state["chosenSql"] if item["sourceId"] != item_id]
+            state["backupJobs"] = [item for item in state["backupJobs"] if not (item["kind"] == "sql" and item["targetId"] in gone)]
         elif parsed.path == "/api/chosen":
             item_id = query.get("id", [""])[0]
             kind = query.get("kind", [""])[0]
-            key = "chosenBases" if kind == "base" else "chosenVms"
+            chosen_keys = {"base": "chosenBases", "vm": "chosenVms", "sql": "chosenSql"}
+            key = chosen_keys.get(kind)
+            if not key:
+                self._send(400, {"error": "Неизвестный список."})
+                return
             state[key] = [item for item in state[key] if item["id"] != item_id]
             state["backupJobs"] = [item for item in state["backupJobs"] if not (item["kind"] == kind and item["targetId"] == item_id)]
         elif parsed.path == "/api/backup-jobs":
@@ -456,7 +478,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         with LOCK:
             fresh = load_state()
-            for key in ("users", "sessions", "storages", "hosts", "jobs", "bases", "clusters", "chosenBases", "chosenVms", "backupJobs"):
+            for key in ("users", "sessions", "storages", "hosts", "jobs", "bases", "clusters", "chosenBases", "chosenVms", "sqlServers", "chosenSql", "backupJobs"):
                 fresh[key] = state[key]
             save_state(fresh)
         self._send(200, {"ok": True})
@@ -934,15 +956,61 @@ class Handler(BaseHTTPRequestHandler):
             save_state(fresh)
         self._send(200, {"catalog": names})
 
+    def _add_sql(self) -> None:
+        payload = self._read_json()
+        name = str(payload.get("name", "")).strip()
+        host = str(payload.get("host", "")).strip()
+        login = str(payload.get("login", "")).strip()
+        secret = str(payload.get("secret", ""))
+        if not name or not host or not login or not secret:
+            self._send(400, {"error": "Нужны имя, адрес, логин SQL и пароль."})
+            return
+        with LOCK:
+            state = load_state()
+            state["sqlServers"].append(
+                {
+                    "id": secrets.token_hex(8),
+                    "name": name,
+                    "host": host,
+                    "port": str(payload.get("port") or "1433"),
+                    "login": login,
+                    "secret": secret,
+                    "catalog": [],
+                }
+            )
+            save_state(state)
+        self._send(200, {"ok": True})
+
+    def _refresh_sql(self) -> None:
+        payload = self._read_json()
+        with LOCK:
+            state = load_state()
+        server_row = next((item for item in state["sqlServers"] if item["id"] == payload.get("id")), None)
+        if not server_row:
+            self._send(404, {"error": "Сервер SQL не найден."})
+            return
+        try:
+            names = sql_catalog(server_row)
+        except Exception as error:
+            self._send(400, {"error": str(error)})
+            return
+        with LOCK:
+            fresh = load_state()
+            for item in fresh["sqlServers"]:
+                if item["id"] == server_row["id"]:
+                    item["catalog"] = names
+            save_state(fresh)
+        self._send(200, {"catalog": names})
+
     def _add_chosen(self) -> None:
         payload = self._read_json()
         kind = payload.get("kind")
         name = str(payload.get("name", "")).strip()
         source = str(payload.get("sourceId", ""))
-        if kind not in ("base", "vm") or not name or not source:
+        if kind not in ("base", "vm", "sql") or not name or not source:
             self._send(400, {"error": "Выберите базу или машину из списка."})
             return
-        key = "chosenBases" if kind == "base" else "chosenVms"
+        key = {"base": "chosenBases", "vm": "chosenVms", "sql": "chosenSql"}[kind]
         with LOCK:
             state = load_state()
             if any(item["sourceId"] == source and item["name"] == name for item in state[key]):
@@ -955,7 +1023,7 @@ class Handler(BaseHTTPRequestHandler):
     def _add_backup_job(self) -> None:
         payload = self._read_json()
         kind = payload.get("kind")
-        if kind not in ("base", "vm") or not payload.get("targetId") or not payload.get("storageId"):
+        if kind not in ("base", "vm", "sql") or not payload.get("targetId") or not payload.get("storageId"):
             self._send(400, {"error": "Нужны объект и диск."})
             return
         schedule = read_schedule(payload.get("schedule"))
@@ -1040,6 +1108,13 @@ def perform_backup(state: dict, job: dict) -> list:
             stamp, parent = open_backup(storage, folder, "vms", chosen["name"])
             vm_job = {**job, "vmName": chosen["name"], "stampDir": str(stamp)}
             log = run_vm(vm_job, host, storage)
+        elif job["kind"] == "sql":
+            chosen = next((item for item in state["chosenSql"] if item["id"] == job["targetId"]), None)
+            sql_server = next((item for item in state["sqlServers"] if chosen and item["id"] == chosen["sourceId"]), None)
+            if not chosen or not sql_server:
+                return ["база или сервер SQL не найдены"]
+            stamp, parent = open_backup(storage, folder, "sql", chosen["name"])
+            log = [sql_backup(sql_server, chosen["name"], storage, stamp)]
         else:
             chosen = next((item for item in state["chosenBases"] if item["id"] == job["targetId"]), None)
             cluster = next((item for item in state["clusters"] if chosen and item["id"] == chosen["sourceId"]), None)
