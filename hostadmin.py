@@ -626,37 +626,113 @@ def new_stamp(folder: Path) -> Path:
 
 
 def sqlcmd_path() -> str:
-    for candidate in ("sqlcmd", "/opt/mssql-tools18/bin/sqlcmd", "/opt/mssql-tools/bin/sqlcmd"):
-        if candidate.startswith("/"):
-            if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
-                return candidate
-            continue
-        found = shutil.which(candidate)
+    extra = "/opt/mssql-tools18/bin:/opt/mssql-tools/bin:/opt/mssql-tools17/bin"
+    path = os.environ.get("PATH", "")
+    for candidate in ("sqlcmd",):
+        found = shutil.which(candidate, path=path + ":" + extra)
         if found:
             return found
-    raise RuntimeError("Не найден sqlcmd. Установите пакет mssql-tools18.")
+    for candidate in (
+        "/opt/mssql-tools18/bin/sqlcmd",
+        "/opt/mssql-tools/bin/sqlcmd",
+        "/opt/mssql-tools17/bin/sqlcmd",
+        "/usr/bin/sqlcmd",
+    ):
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    raise RuntimeError("Не найден sqlcmd. Установите пакет mssql-tools18 или python3-pymssql.")
+
+
+def decode_sql_output(raw: bytes) -> str:
+    if not raw:
+        return ""
+    if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return raw.decode("utf-16").replace("\x00", "")
+    sample = raw[:24]
+    if b"\x00" in sample:
+        try:
+            return raw.decode("utf-16le").replace("\x00", "")
+        except UnicodeDecodeError:
+            pass
+    return raw.decode("utf-8", errors="replace").replace("\x00", "")
+
+
+def sql_address(server: dict) -> str:
+    host = str(server.get("host", "")).strip()
+    if "\\" in host or "," in host:
+        return host
+    return f"{host},{server.get('port') or 1433}"
 
 
 def sql_exec(server: dict, query: str, timeout: int = 60) -> str:
-    binary = sqlcmd_path()
+    pymssql_error = ""
+    if os.environ.get("ONEC_SQL") != "sqlcmd":
+        try:
+            import pymssql
+        except ImportError:
+            pymssql = None
+        if pymssql is not None:
+            host = str(server.get("host", "")).strip()
+            try:
+                connection = pymssql.connect(
+                    server=host,
+                    port=int(server.get("port") or 1433),
+                    user=str(server.get("login", "")),
+                    password=str(server.get("secret", "")),
+                    login_timeout=20,
+                    timeout=timeout,
+                    tds_version="7.4",
+                )
+                try:
+                    cursor = connection.cursor()
+                    cursor.execute(query)
+                    if cursor.description:
+                        return "\n".join("" if row[0] is None else str(row[0]) for row in cursor.fetchall())
+                    connection.commit()
+                    return ""
+                finally:
+                    connection.close()
+            except Exception as error:
+                pymssql_error = str(error)
+    try:
+        binary = sqlcmd_path()
+    except RuntimeError as error:
+        if pymssql_error:
+            raise RuntimeError(pymssql_error) from error
+        raise
     env = os.environ.copy()
     env["SQLCMDPASSWORD"] = str(server.get("secret", ""))
-    address = f"{server.get('host')},{server.get('port') or 1433}"
+    address = sql_address(server)
     last = ""
-    for trust in (True, False):
-        args = [binary, "-S", address, "-U", str(server.get("login", "")), "-b", "-h", "-1", "-W"]
-        if trust:
-            args.append("-C")
-        args.extend(["-Q", query])
-        result = subprocess.run(args, text=True, capture_output=True, timeout=timeout, env=env, check=False)
-        last = (result.stderr or result.stdout or "").strip()
+    variants = (["-No", "-C"], ["-C"], [])
+    for extra in variants:
+        args = [binary, "-S", address, "-U", str(server.get("login", "")), "-b", "-W", "-h-1", "-s|", "-f", "65001", *extra, "-Q", query]
+        result = subprocess.run(args, capture_output=True, timeout=timeout, env=env, check=False)
+        text = decode_sql_output(result.stdout)
+        err = decode_sql_output(result.stderr)
+        last = (err or text).strip()
         if result.returncode == 0:
-            return result.stdout
+            return text
         lowered = last.lower()
-        if trust and ("option" in lowered or "unknown" in lowered or "неизвест" in lowered):
+        if extra and ("option" in lowered or "unknown" in lowered or "неизвест" in lowered or "unrecognized" in lowered):
             continue
         break
+    if pymssql_error and not last:
+        last = pymssql_error
     raise RuntimeError(last[:500] or "sqlcmd не выполнен")
+
+
+def sql_names(text: str) -> list:
+    names = []
+    for line in text.replace("\x00", "").splitlines():
+        name = line.strip().strip("|").strip()
+        if not name or name.startswith("(") or set(name) <= {"-", " "}:
+            continue
+        lowered = name.lower()
+        if lowered in {"name"} or "rows affected" in lowered or "затронуто строк" in lowered:
+            continue
+        names.append(name)
+    return names
 
 
 def sql_catalog(server: dict) -> list:
@@ -666,13 +742,7 @@ def sql_catalog(server: dict) -> list:
         server,
         "SET NOCOUNT ON; SELECT name FROM sys.databases WHERE name <> 'tempdb' AND state = 0 ORDER BY name",
     )
-    names = []
-    for line in text.splitlines():
-        name = line.strip()
-        if not name or name.startswith("(") or "affected" in name.lower():
-            continue
-        names.append(name)
-    return names
+    return sql_names(text)
 
 
 def sql_ident(name: str) -> str:

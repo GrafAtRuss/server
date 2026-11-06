@@ -127,7 +127,7 @@
   <div id="boot" class="login"><p class="muted mono">Открываем консоль…</p></div>
   <form id="login" class="login hidden">
     <div class="card">
-      <p class="eyebrow">1.2.12</p>
+      <p class="eyebrow">1.2.13</p>
       <h1 style="margin-top:12px">Консоль платформы</h1>
       <label class="lbl" for="login-name">Логин</label>
       <input id="login-name" autocomplete="username" style="margin-top:8px" />
@@ -140,7 +140,7 @@
   <div id="app" class="shell hidden">
     <aside>
       <div>
-        <p class="eyebrow" style="color:var(--rail-dim)">1.2.12</p>
+        <p class="eyebrow" style="color:var(--rail-dim)">1.2.13</p>
         <p style="margin:4px 0 0;font-size:18px;font-weight:600">Консоль платформы</p>
       </div>
       <nav class="nav" style="overflow:auto">
@@ -467,9 +467,10 @@
         return `${row(item, "clusters")}<p class="mono muted">${item.host}:${item.port}</p><div class="stack"><button class="ghost" type="button" data-catalog="clusters" data-id="${item.id}">Обновить список</button><select data-pick="${item.id}">${options}</select><button class="dark" type="button" data-take="base" data-source="${item.id}">Взять в работу</button></div>${chosen}`;
       }).join("") || "<p class='muted'>Серверы баз не подключены.</p>";
       $("sql-list").innerHTML = (state.sqlServers || []).map((item) => {
-        const options = (item.catalog || []).map((name) => `<option>${esc(name)}</option>`).join("");
+        const options = (item.catalog || []).map((name) => `<option value="${esc(name)}">${esc(name)}</option>`).join("") || `<option value="">Список пуст</option>`;
         const chosen = (state.chosenSql || []).filter((base) => base.sourceId === item.id).map((base) => `<div style="margin-top:12px"><b>${esc(base.name)}</b> <button class="ghost" type="button" data-drop="chosen:${base.id}" data-kind="sql">Убрать</button>${jobsOf("sql", base.id).map(jobHtml).join("")}${jobForm(base.id, "sql")}</div>`).join("");
-        return `${row(item, "sql")}<p class="mono muted">${esc(item.host)}:${esc(item.port || "1433")}</p><div class="stack"><button class="ghost" type="button" data-catalog="sql" data-id="${item.id}">Обновить список</button><select data-pick="${item.id}">${options}</select><button class="dark" type="button" data-take="sql" data-source="${item.id}">Взять в работу</button></div>${chosen}`;
+        const problem = item.catalogError ? `<p class="danger">${esc(item.catalogError)}</p>` : "";
+        return `${row(item, "sql")}<p class="mono muted">${esc(item.host)}:${esc(item.port || "1433")}</p><div class="stack"><button class="ghost" type="button" data-catalog="sql" data-id="${item.id}">Обновить список</button><select data-pick="${item.id}">${options}</select><button class="dark" type="button" data-take="sql" data-source="${item.id}">Взять в работу</button></div>${problem}${chosen}`;
       }).join("") || "<p class='muted'>Серверы SQL не подключены.</p>";
       $("users").innerHTML = state.users.map((user) => {
         const self = user.login === state.me.login;
@@ -699,9 +700,10 @@
       event.preventDefault();
       const body = Object.fromEntries(new FormData(event.target).entries());
       try {
-        await send("/api/sql", body);
+        const result = await send("/api/sql", body);
         event.target.reset();
         await refresh();
+        if (result.warning && $("sql-log")) $("sql-log").textContent = result.warning;
       } catch { /* shown */ }
     });
 
@@ -988,8 +990,11 @@
       if (catalog) {
         try {
           await send("/api/" + catalog + "/catalog", { id: event.target.dataset.id });
-          await refresh();
-        } catch { /* shown */ }
+          if (catalog === "sql" && $("sql-log")) $("sql-log").textContent = "Список баз обновлён.";
+        } catch (error) {
+          if (catalog === "sql" && $("sql-log")) $("sql-log").textContent = error.message;
+        }
+        await refresh();
         return;
       }
       const take = event.target.dataset.take;

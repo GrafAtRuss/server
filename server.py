@@ -35,7 +35,7 @@ from hostadmin import (
 )
 from ops import deliver, list_storage, probe, public_copy, run_vm, schedule_due
 
-PRODUCT_VERSION = "1.2.12"
+PRODUCT_VERSION = "1.2.13"
 LOGIN_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
 
 STATE_DIR = Path(os.environ.get("ONEC_STATE_DIR", "/var/lib/onec-console"))
@@ -967,19 +967,23 @@ class Handler(BaseHTTPRequestHandler):
             return
         with LOCK:
             state = load_state()
-            state["sqlServers"].append(
-                {
-                    "id": secrets.token_hex(8),
-                    "name": name,
-                    "host": host,
-                    "port": str(payload.get("port") or "1433"),
-                    "login": login,
-                    "secret": secret,
-                    "catalog": [],
-                }
-            )
+            row = {
+                "id": secrets.token_hex(8),
+                "name": name,
+                "host": host,
+                "port": str(payload.get("port") or "1433"),
+                "login": login,
+                "secret": secret,
+                "catalog": [],
+                "catalogError": "",
+            }
+            try:
+                row["catalog"] = sql_catalog(row)
+            except Exception as error:
+                row["catalogError"] = str(error)
+            state["sqlServers"].append(row)
             save_state(state)
-        self._send(200, {"ok": True})
+        self._send(200, {"ok": True, "warning": row["catalogError"], "catalog": row["catalog"]})
 
     def _refresh_sql(self) -> None:
         payload = self._read_json()
@@ -991,15 +995,23 @@ class Handler(BaseHTTPRequestHandler):
             return
         try:
             names = sql_catalog(server_row)
+            error = ""
         except Exception as error:
-            self._send(400, {"error": str(error)})
-            return
+            names = []
+            message = str(error)
+        else:
+            message = ""
         with LOCK:
             fresh = load_state()
             for item in fresh["sqlServers"]:
                 if item["id"] == server_row["id"]:
-                    item["catalog"] = names
+                    if not message:
+                        item["catalog"] = names
+                    item["catalogError"] = message
             save_state(fresh)
+        if message:
+            self._send(400, {"error": message})
+            return
         self._send(200, {"catalog": names})
 
     def _add_chosen(self) -> None:
