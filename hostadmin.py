@@ -429,7 +429,10 @@ def schedule_power(action: str) -> str:
 
 
 def github_text(name: str) -> str:
-    request = urllib.request.Request(f"{RAW}/{name}", headers={"User-Agent": "onec-console"})
+    request = urllib.request.Request(
+        f"{RAW}/{name}?t={int(time.time())}",
+        headers={"User-Agent": "onec-console", "Cache-Control": "no-cache", "Pragma": "no-cache"},
+    )
     with urllib.request.urlopen(request, timeout=15) as response:
         return response.read().decode()
 

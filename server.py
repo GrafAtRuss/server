@@ -29,7 +29,7 @@ from hostadmin import (
     vm_catalog,
 )
 
-PRODUCT_VERSION = "1.2.5"
+PRODUCT_VERSION = "1.2.6"
 
 STATE_DIR = Path(os.environ.get("ONEC_STATE_DIR", "/var/lib/onec-console"))
 CACHE_DIR = Path(os.environ.get("ONEC_CACHE_DIR", "/var/cache/onec-platform"))

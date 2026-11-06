@@ -2,6 +2,7 @@
 
 import json
 import os
+import re
 import ssl
 import subprocess
 import time
@@ -11,6 +12,7 @@ import urllib.request
 from base64 import b64encode
 from datetime import datetime
 from pathlib import Path
+from xml.sax.saxutils import escape as xml_escape
 
 MOUNT_ROOT = Path(os.environ.get("ONEC_MOUNT_ROOT", "/mnt/onec-console"))
 CTX = ssl._create_unverified_context()
@@ -107,13 +109,12 @@ def run_vm(job: dict, host: dict, storage: dict) -> list:
         ]
     log = []
     turned_off = False
-    base = api_base(host["host"])
+    control = None
     try:
-        session, root = vsphere_login(base, host["login"], host["secret"])
-        vm_id = find_vm(base, root, session, job["vmName"])
+        control = connect_host(host)
         log.append(f"мягкое выключение {job['vmName']}")
-        api(base, root, session, f"/vcenter/vm/{vm_id}/guest/power?action=shutdown", method="POST")
-        if not wait_off(base, root, session, vm_id):
+        control.shutdown(job["vmName"])
+        if not control.wait_off(job["vmName"]):
             log.append("машина не выключилась за 3 минуты, бекап отменён")
             return log
         turned_off = True
@@ -129,9 +130,9 @@ def run_vm(job: dict, host: dict, storage: dict) -> list:
     except Exception as error:
         log.append(str(error))
     finally:
-        if turned_off:
+        if turned_off and control:
             try:
-                api(base, root, session, f"/vcenter/vm/{vm_id}/power?action=start", method="POST")
+                control.power_on(job["vmName"])
                 log.append(f"включение {job['vmName']}")
             except Exception as error:
                 log.append(f"не удалось включить: {error}")
@@ -211,15 +212,215 @@ def vsphere_login(base: str, login: str, secret: str) -> tuple[str, str]:
         if session:
             return str(session), root
         errors.append(f"{root} не вернул сессию")
+    curl_session = curl_login(base, login, secret)
+    if curl_session:
+        return curl_session
     raise RuntimeError("ESXi или vSphere не пустил: " + "; ".join(errors))
 
 
+def curl_login(base: str, login: str, secret: str):
+    curl = shutil_which("curl")
+    if not curl:
+        return None
+    for path, root in (("/rest/com/vmware/cis/session", "/rest"), ("/api/session", "/api")):
+        result = subprocess.run(
+            [
+                curl, "-sk", "--max-time", "20", "-u", f"{login}:{secret}",
+                "-H", "vmware-use-header-authn: true", "-H", "Accept: application/json",
+                "-X", "POST", "-w", "\n%{http_code}", base.rstrip("/") + path,
+            ],
+            capture_output=True, text=True, timeout=25, check=False,
+        )
+        lines = (result.stdout or "").splitlines()
+        if not lines or lines[-1] != "200":
+            continue
+        raw = "\n".join(lines[:-1]).strip()
+        session = json.loads(raw) if raw.startswith("{") else raw.strip('"')
+        if isinstance(session, dict):
+            session = session.get("value", "")
+        if session:
+            return str(session), root
+    return None
+
+
 def list_vm_names(host: dict) -> list:
+    return connect_host(host).names()
+
+
+def connect_host(host: dict):
     base = api_base(host["host"])
-    session, root = vsphere_login(base, host["login"], host["secret"])
-    payload = api(base, root, session, "/vcenter/vm")
-    rows = payload.get("value", payload) if isinstance(payload, dict) else payload
-    return [row.get("name") for row in rows or [] if isinstance(row, dict) and row.get("name")]
+    rest_error = ""
+    try:
+        session, root = vsphere_login(base, host["login"], host["secret"])
+        return RestHost(base, root, session)
+    except RuntimeError as error:
+        rest_error = str(error)
+    try:
+        return SoapHost.login(base, host["login"], host["secret"])
+    except RuntimeError as error:
+        raise RuntimeError(f"{rest_error}. {error}") from error
+
+
+class RestHost:
+    def __init__(self, base: str, root: str, session: str):
+        self.base = base
+        self.root = root
+        self.session = session
+        self.vm_id = ""
+
+    def names(self) -> list:
+        payload = api(self.base, self.root, self.session, "/vcenter/vm")
+        rows = payload.get("value", payload) if isinstance(payload, dict) else payload
+        return [row.get("name") for row in rows or [] if isinstance(row, dict) and row.get("name")]
+
+    def shutdown(self, name: str) -> None:
+        self.vm_id = find_vm(self.base, self.root, self.session, name)
+        api(self.base, self.root, self.session, f"/vcenter/vm/{self.vm_id}/guest/power?action=shutdown", method="POST")
+
+    def wait_off(self, name: str) -> bool:
+        return wait_off(self.base, self.root, self.session, self.vm_id)
+
+    def power_on(self, name: str) -> None:
+        api(self.base, self.root, self.session, f"/vcenter/vm/{self.vm_id}/power?action=start", method="POST")
+
+
+class SoapHost:
+    def __init__(self, base: str, cookie: str, collector: str, view_manager: str, root_folder: str):
+        self.base = base
+        self.cookie = cookie
+        self.collector = collector
+        self.view_manager = view_manager
+        self.root_folder = root_folder
+        self.morefs = {}
+
+    @classmethod
+    def login(cls, base: str, login: str, secret: str):
+        content, _ = soap_call(
+            base,
+            "<urn:RetrieveServiceContent><urn:_this type=\"ServiceInstance\">ServiceInstance</urn:_this></urn:RetrieveServiceContent>",
+        )
+        collector = soap_value(content, "propertyCollector")
+        view_manager = soap_value(content, "viewManager") or "ViewManager"
+        root_folder = soap_value(content, "rootFolder") or "ha-folder-root"
+        session_manager = soap_value(content, "sessionManager")
+        if not collector or not session_manager:
+            raise RuntimeError("ESXi SOAP не отдал службу входа")
+        _, cookie = soap_call(
+            base,
+            "<urn:Login>"
+            f"<urn:_this type=\"SessionManager\">{xml_escape(session_manager)}</urn:_this>"
+            f"<urn:userName>{xml_escape(login)}</urn:userName>"
+            f"<urn:password>{xml_escape(secret)}</urn:password>"
+            "</urn:Login>",
+        )
+        if "vmware_soap_session" not in cookie:
+            raise RuntimeError("ESXi SOAP не открыл сессию")
+        return cls(base, cookie, collector, view_manager, root_folder)
+
+    def names(self) -> list:
+        self.morefs = soap_vm_map(self)
+        return list(self.morefs)
+
+    def shutdown(self, name: str) -> None:
+        moref = self.moref(name)
+        soap_call(self.base, f"<urn:ShutdownGuest><urn:_this type=\"VirtualMachine\">{xml_escape(moref)}</urn:_this></urn:ShutdownGuest>", self.cookie)
+
+    def wait_off(self, name: str) -> bool:
+        moref = self.moref(name)
+        deadline = time.time() + 180
+        while time.time() < deadline:
+            if soap_power(self, moref) == "poweredOff":
+                return True
+            time.sleep(5)
+        return False
+
+    def power_on(self, name: str) -> None:
+        moref = self.moref(name)
+        soap_call(self.base, f"<urn:PowerOnVM_Task><urn:_this type=\"VirtualMachine\">{xml_escape(moref)}</urn:_this></urn:PowerOnVM_Task>", self.cookie)
+
+    def moref(self, name: str) -> str:
+        if name not in self.morefs:
+            self.morefs = soap_vm_map(self)
+        if name not in self.morefs:
+            raise RuntimeError(f"машина {name} не найдена")
+        return self.morefs[name]
+
+
+def soap_call(base: str, body: str, cookie: str = "") -> tuple[str, str]:
+    xml = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" '
+        'xmlns:urn="urn:vim25" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">'
+        f"<soapenv:Body>{body}</soapenv:Body></soapenv:Envelope>"
+    ).encode()
+    headers = {"Content-Type": "text/xml; charset=utf-8", "SOAPAction": "urn:vim25/6.7"}
+    if cookie:
+        headers["Cookie"] = cookie.split(";", 1)[0]
+    request = urllib.request.Request(base.rstrip("/") + "/sdk", data=xml, headers=headers)
+    try:
+        with urllib.request.urlopen(request, timeout=30, context=CTX) as response:
+            payload = response.read().decode("utf-8", "replace")
+            set_cookie = response.headers.get("Set-Cookie", "")
+    except urllib.error.HTTPError as error:
+        detail = error.read().decode("utf-8", "replace")[:240].strip()
+        raise RuntimeError(f"ESXi SOAP {error.code}: {detail}") from error
+    except urllib.error.URLError as error:
+        raise RuntimeError(f"ESXi SOAP: {error.reason}") from error
+    if "<faultstring>" in payload:
+        start = payload.find("<faultstring>") + len("<faultstring>")
+        end = payload.find("</faultstring>")
+        raise RuntimeError(payload[start:end] or "ESXi отклонил SOAP")
+    return payload, set_cookie or cookie
+
+
+def soap_value(payload: str, tag: str) -> str:
+    match = re.search(rf"<(?:\w+:)?{tag}[^>]*>([^<]+)", payload)
+    return match.group(1).strip() if match else ""
+
+
+def soap_vm_map(host: SoapHost) -> dict:
+    created, _ = soap_call(
+        host.base,
+        "<urn:CreateContainerView>"
+        f"<urn:_this type=\"ViewManager\">{xml_escape(host.view_manager)}</urn:_this>"
+        f"<urn:container type=\"Folder\">{xml_escape(host.root_folder)}</urn:container>"
+        "<urn:type>VirtualMachine</urn:type><urn:recursive>true</urn:recursive>"
+        "</urn:CreateContainerView>",
+        host.cookie,
+    )
+    view = soap_value(created, "returnval")
+    if not view:
+        raise RuntimeError("ESXi не отдал список машин")
+    props, _ = soap_call(
+        host.base,
+        "<urn:RetrieveProperties>"
+        f"<urn:_this type=\"PropertyCollector\">{xml_escape(host.collector)}</urn:_this>"
+        "<urn:specSet><urn:propSet><urn:type>VirtualMachine</urn:type><urn:pathSet>name</urn:pathSet></urn:propSet>"
+        f"<urn:objectSet><urn:obj type=\"ContainerView\">{xml_escape(view)}</urn:obj><urn:skip>true</urn:skip>"
+        '<urn:selectSet xsi:type="urn:TraversalSpec"><urn:type>ContainerView</urn:type><urn:path>view</urn:path><urn:skip>false</urn:skip></urn:selectSet>'
+        "</urn:objectSet></urn:specSet></urn:RetrieveProperties>",
+        host.cookie,
+    )
+    found = {}
+    for block in re.findall(r"<(?:\w+:)?returnval>(.*?)</(?:\w+:)?returnval>", props, re.S):
+        moref = re.search(r'type="VirtualMachine"[^>]*>([^<]+)', block)
+        name = re.search(r"<(?:\w+:)?val[^>]*>([^<]+)", block)
+        if moref and name:
+            found[name.group(1).strip()] = moref.group(1).strip()
+    return found
+
+
+def soap_power(host: SoapHost, moref: str) -> str:
+    payload, _ = soap_call(
+        host.base,
+        "<urn:RetrieveProperties>"
+        f"<urn:_this type=\"PropertyCollector\">{xml_escape(host.collector)}</urn:_this>"
+        "<urn:specSet><urn:propSet><urn:type>VirtualMachine</urn:type><urn:pathSet>runtime.powerState</urn:pathSet></urn:propSet>"
+        f"<urn:objectSet><urn:obj type=\"VirtualMachine\">{xml_escape(moref)}</urn:obj></urn:objectSet></urn:specSet>"
+        "</urn:RetrieveProperties>",
+        host.cookie,
+    )
+    return soap_value(payload, "val")
 
 
 def api(base: str, root: str, session: str, path: str, method="GET"):

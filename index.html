@@ -127,7 +127,7 @@
   <div id="boot" class="login"><p class="muted mono">Открываем консоль…</p></div>
   <form id="login" class="login hidden">
     <div class="card">
-      <p class="eyebrow">1.2.5</p>
+      <p class="eyebrow">1.2.6</p>
       <h1 style="margin-top:12px">Консоль платформы</h1>
       <label class="lbl" for="login-name">Логин</label>
       <input id="login-name" autocomplete="username" style="margin-top:8px" />
@@ -140,7 +140,7 @@
   <div id="app" class="shell hidden">
     <aside>
       <div>
-        <p class="eyebrow" style="color:var(--rail-dim)">1.2.5</p>
+        <p class="eyebrow" style="color:var(--rail-dim)">1.2.6</p>
         <p style="margin:4px 0 0;font-size:18px;font-weight:600">Консоль платформы</p>
       </div>
       <nav class="nav" style="overflow:auto">
@@ -242,7 +242,7 @@
       <section id="tab-bases" class="hidden">
         <form id="cluster-form" class="panel">
           <strong>Сервер баз</strong>
-          <p class="muted">Кластер запоминается. Базу выбирают из списка rac, а не вводят руками.</p>
+          <p class="muted">Кластер запоминается. В логин нужен администратор кластера с паролем 1С, не пользователь базы и не учётная запись Windows.</p>
           <div class="stack">
             <input name="name" placeholder="Имя подключения" />
             <input name="host" placeholder="srv-1c" />
@@ -367,7 +367,7 @@
     let me = null;
 
     async function api(url, options) {
-      const response = await fetch(url, { credentials: "same-origin", ...options });
+      const response = await fetch(url, { credentials: "same-origin", cache: "no-store", ...options });
       const data = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(data.error || "Ошибка запроса");
       return data;
