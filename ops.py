@@ -1,5 +1,6 @@
 """Storage mounts, cloud checks, and ESXi/vSphere power cycle."""
 
+import http.client
 import json
 import os
 import re
@@ -426,31 +427,63 @@ def api_base(host: str) -> str:
     return urllib.parse.urlunsplit((parts.scheme or "https", parts.netloc, "", "", ""))
 
 
+def http_exchange(url: str, method: str, headers: dict, body: bytes = b"", keep_method: bool = False):
+    current = url
+    payload = body
+    for _ in range(5):
+        parts = urllib.parse.urlsplit(current)
+        if parts.scheme == "https":
+            conn = http.client.HTTPSConnection(parts.hostname, parts.port or 443, timeout=25, context=CTX)
+        else:
+            conn = http.client.HTTPConnection(parts.hostname, parts.port or 80, timeout=25)
+        path = parts.path or "/"
+        if parts.query:
+            path += "?" + parts.query
+        conn.request(method, path, body=payload if payload is not None else None, headers=headers)
+        response = conn.getresponse()
+        raw = response.read()
+        status = response.status
+        location = response.getheader("Location")
+        response_headers = {key.lower(): value for key, value in response.getheaders()}
+        conn.close()
+        if status in (301, 302, 303, 307, 308) and location:
+            current = urllib.parse.urljoin(current, location)
+            if not keep_method and status in (301, 302, 303):
+                method = "GET"
+                payload = None
+            continue
+        return status, raw, response_headers
+    raise RuntimeError("слишком много перенаправлений")
+
+
 def vsphere_login(base: str, login: str, secret: str) -> tuple[str, str]:
-    """Сессия ESXi или vCenter. ESXi 6.7 требует заголовок без тела, ESXi 7+ отвечает и на /api."""
+    """Сессия ESXi или vCenter. Заголовок входа сохраняется и после переадресации vSphere 7."""
     token = b64encode(f"{login}:{secret}".encode()).decode()
     errors = []
     attempts = (
+        ("/api", "/session", False),
         ("/rest", "/com/vmware/cis/session", True),
-        ("/api", "/session", True),
         ("/rest", "/com/vmware/cis/session", False),
     )
     for root, path, header_auth in attempts:
-        headers = {"Authorization": f"Basic {token}", "Accept": "application/json", "User-Agent": "onec-console"}
+        headers = {
+            "Authorization": f"Basic {token}",
+            "Accept": "application/json",
+            "User-Agent": "onec-console",
+        }
         if header_auth:
             headers["vmware-use-header-authn"] = "true"
-        request = urllib.request.Request(base.rstrip("/") + root + path, method="POST", headers=headers)
+        url = base.rstrip("/") + root + path
         try:
-            with urllib.request.urlopen(request, timeout=20, context=CTX) as response:
-                raw = response.read().decode().strip()
-        except urllib.error.HTTPError as error:
-            detail = error.read().decode(errors="replace")[:180].strip()
-            errors.append(f"{root} ответил {error.code}" + (f": {detail}" if detail else ""))
+            status, raw, _ = http_exchange(url, "POST", headers, b"", keep_method=True)
+        except Exception as error:
+            errors.append(f"{root}: {error}")
             continue
-        except urllib.error.URLError as error:
-            errors.append(f"{root}: {error.reason}")
+        text = raw.decode("utf-8", "replace").strip()
+        if status >= 400:
+            errors.append(f"{root} ответил {status}: {auth_detail(text)}")
             continue
-        session = json.loads(raw) if raw.startswith("{") else raw.strip('"')
+        session = json.loads(text) if text.startswith("{") else text.strip('"')
         if isinstance(session, dict):
             session = session.get("value", "")
         if session:
@@ -460,6 +493,15 @@ def vsphere_login(base: str, login: str, secret: str) -> tuple[str, str]:
     if curl_session:
         return curl_session
     raise RuntimeError("ESXi или vSphere не пустил: " + "; ".join(errors))
+
+
+def auth_detail(text: str) -> str:
+    if "authentication.invalid" in text or "Invalid credentials" in text or "Неверн" in text:
+        return "логин или пароль не приняты"
+    if "authentication.required" in text or "Authentication required" in text:
+        return "сервер не увидел пароль"
+    compact = " ".join(text.split())
+    return compact[:180] if compact else "пустой ответ"
 
 
 def curl_login(base: str, login: str, secret: str):
@@ -529,20 +571,35 @@ class RestHost:
 
 
 class SoapHost:
-    def __init__(self, base: str, cookie: str, collector: str, view_manager: str, root_folder: str):
+    def __init__(self, base: str, cookie: str, collector: str, view_manager: str, root_folder: str, action: str):
         self.base = base
         self.cookie = cookie
         self.collector = collector
         self.view_manager = view_manager
         self.root_folder = root_folder
+        self.action = action
         self.morefs = {}
 
     @classmethod
     def login(cls, base: str, login: str, secret: str):
-        content, _ = soap_call(
-            base,
-            "<urn:RetrieveServiceContent><urn:_this type=\"ServiceInstance\">ServiceInstance</urn:_this></urn:RetrieveServiceContent>",
-        )
+        content = ""
+        action = ""
+        errors = []
+        for candidate in ('"urn:vim25/7.0"', '"urn:vim25/6.7"', "urn:vim25/7.0", "urn:vim25"):
+            try:
+                content, _ = soap_call(
+                    base,
+                    "<urn:RetrieveServiceContent><urn:_this type=\"ServiceInstance\">ServiceInstance</urn:_this></urn:RetrieveServiceContent>",
+                    action=candidate,
+                )
+            except RuntimeError as error:
+                errors.append(str(error))
+                continue
+            if soap_value(content, "sessionManager"):
+                action = candidate
+                break
+        if not action:
+            raise RuntimeError(errors[-1] if errors else "ESXi SOAP не ответил")
         collector = soap_value(content, "propertyCollector")
         view_manager = soap_value(content, "viewManager") or "ViewManager"
         root_folder = soap_value(content, "rootFolder") or "ha-folder-root"
@@ -556,10 +613,11 @@ class SoapHost:
             f"<urn:userName>{xml_escape(login)}</urn:userName>"
             f"<urn:password>{xml_escape(secret)}</urn:password>"
             "</urn:Login>",
+            action=action,
         )
         if "vmware_soap_session" not in cookie:
             raise RuntimeError("ESXi SOAP не открыл сессию")
-        return cls(base, cookie, collector, view_manager, root_folder)
+        return cls(base, cookie, collector, view_manager, root_folder, action)
 
     def names(self) -> list:
         self.morefs = soap_vm_map(self)
@@ -567,7 +625,7 @@ class SoapHost:
 
     def shutdown(self, name: str) -> None:
         moref = self.moref(name)
-        soap_call(self.base, f"<urn:ShutdownGuest><urn:_this type=\"VirtualMachine\">{xml_escape(moref)}</urn:_this></urn:ShutdownGuest>", self.cookie)
+        soap_call(self.base, f"<urn:ShutdownGuest><urn:_this type=\"VirtualMachine\">{xml_escape(moref)}</urn:_this></urn:ShutdownGuest>", self.cookie, self.action)
 
     def wait_off(self, name: str) -> bool:
         moref = self.moref(name)
@@ -580,7 +638,7 @@ class SoapHost:
 
     def power_on(self, name: str) -> None:
         moref = self.moref(name)
-        soap_call(self.base, f"<urn:PowerOnVM_Task><urn:_this type=\"VirtualMachine\">{xml_escape(moref)}</urn:_this></urn:PowerOnVM_Task>", self.cookie)
+        soap_call(self.base, f"<urn:PowerOnVM_Task><urn:_this type=\"VirtualMachine\">{xml_escape(moref)}</urn:_this></urn:PowerOnVM_Task>", self.cookie, self.action)
 
     def moref(self, name: str) -> str:
         if name not in self.morefs:
@@ -590,31 +648,27 @@ class SoapHost:
         return self.morefs[name]
 
 
-def soap_call(base: str, body: str, cookie: str = "") -> tuple[str, str]:
+def soap_call(base: str, body: str, cookie: str = "", action: str = '"urn:vim25/7.0"') -> tuple[str, str]:
     xml = (
         '<?xml version="1.0" encoding="UTF-8"?>'
         '<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" '
         'xmlns:urn="urn:vim25" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">'
         f"<soapenv:Body>{body}</soapenv:Body></soapenv:Envelope>"
     ).encode()
-    headers = {"Content-Type": "text/xml; charset=utf-8", "SOAPAction": "urn:vim25/6.7"}
+    headers = {"Content-Type": "text/xml; charset=utf-8", "SOAPAction": action}
     if cookie:
         headers["Cookie"] = cookie.split(";", 1)[0]
-    request = urllib.request.Request(base.rstrip("/") + "/sdk", data=xml, headers=headers)
-    try:
-        with urllib.request.urlopen(request, timeout=30, context=CTX) as response:
-            payload = response.read().decode("utf-8", "replace")
-            set_cookie = response.headers.get("Set-Cookie", "")
-    except urllib.error.HTTPError as error:
-        detail = error.read().decode("utf-8", "replace")[:240].strip()
-        raise RuntimeError(f"ESXi SOAP {error.code}: {detail}") from error
-    except urllib.error.URLError as error:
-        raise RuntimeError(f"ESXi SOAP: {error.reason}") from error
-    if "<faultstring>" in payload:
-        start = payload.find("<faultstring>") + len("<faultstring>")
-        end = payload.find("</faultstring>")
-        raise RuntimeError(payload[start:end] or "ESXi отклонил SOAP")
-    return payload, set_cookie or cookie
+    status, raw, response_headers = http_exchange(base.rstrip("/") + "/sdk", "POST", headers, xml, keep_method=True)
+    payload = raw.decode("utf-8", "replace")
+    fault = soap_fault(payload)
+    if status >= 400 or fault:
+        raise RuntimeError(fault or f"ESXi SOAP {status}")
+    return payload, response_headers.get("set-cookie", "") or cookie
+
+
+def soap_fault(payload: str) -> str:
+    match = re.search(r"<(?:\w+:)?faultstring[^>]*>(.*?)</(?:\w+:)?faultstring>", payload, re.S)
+    return match.group(1).strip() if match else ""
 
 
 def soap_value(payload: str, tag: str) -> str:
@@ -631,6 +685,7 @@ def soap_vm_map(host: SoapHost) -> dict:
         "<urn:type>VirtualMachine</urn:type><urn:recursive>true</urn:recursive>"
         "</urn:CreateContainerView>",
         host.cookie,
+        host.action,
     )
     view = soap_value(created, "returnval")
     if not view:
@@ -644,6 +699,7 @@ def soap_vm_map(host: SoapHost) -> dict:
         '<urn:selectSet xsi:type="urn:TraversalSpec"><urn:type>ContainerView</urn:type><urn:path>view</urn:path><urn:skip>false</urn:skip></urn:selectSet>'
         "</urn:objectSet></urn:specSet></urn:RetrieveProperties>",
         host.cookie,
+        host.action,
     )
     found = {}
     for block in re.findall(r"<(?:\w+:)?returnval>(.*?)</(?:\w+:)?returnval>", props, re.S):
@@ -663,18 +719,22 @@ def soap_power(host: SoapHost, moref: str) -> str:
         f"<urn:objectSet><urn:obj type=\"VirtualMachine\">{xml_escape(moref)}</urn:obj></urn:objectSet></urn:specSet>"
         "</urn:RetrieveProperties>",
         host.cookie,
+        host.action,
     )
     return soap_value(payload, "val")
 
 
 def api(base: str, root: str, session: str, path: str, method="GET"):
-    request = urllib.request.Request(
+    status, raw, _ = http_exchange(
         base.rstrip("/") + root + path,
-        method=method,
-        headers={"vmware-api-session-id": session},
+        method,
+        {"vmware-api-session-id": session, "Accept": "application/json"},
+        b"" if method != "GET" else None,
+        keep_method=method != "GET",
     )
-    with urllib.request.urlopen(request, timeout=30, context=CTX) as response:
-        body = response.read().decode()
+    body = raw.decode("utf-8", "replace")
+    if status >= 400:
+        raise RuntimeError(f"vSphere {status}: {auth_detail(body)}")
     if not body:
         return None
     return json.loads(body)
