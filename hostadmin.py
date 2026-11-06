@@ -416,6 +416,32 @@ echo "готово $deb"
     return f"обновление запущено отдельно от службы ({unit}). Журнал: {log_path}"
 
 
+def version_tuple(text: str) -> tuple[int, int, int]:
+    match = re.search(r"(\d+)\.(\d+)\.(\d+)", str(text or ""))
+    if not match:
+        return (0, 0, 0)
+    return (int(match.group(1)), int(match.group(2)), int(match.group(3)))
+
+
+def update_offer(current: str) -> dict:
+    if os.environ.get("ONEC_RELEASE") == "skip":
+        latest = os.environ.get("ONEC_LATEST", current).lstrip("v")
+        return {"current": current, "latest": latest, "available": version_tuple(latest) > version_tuple(current)}
+    request = urllib.request.Request(
+        "https://api.github.com/repos/GrafAtRuss/server/releases/latest",
+        headers={"User-Agent": "onec-console", "Accept": "application/vnd.github+json", "Cache-Control": "no-cache"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:
+            data = json.loads(response.read().decode())
+    except urllib.error.HTTPError as error:
+        return {"current": current, "latest": "", "available": False, "error": f"GitHub {error.code}"}
+    except OSError as error:
+        return {"current": current, "latest": "", "available": False, "error": str(error)}
+    latest = str(data.get("tag_name") or data.get("name") or "").lstrip("v")
+    return {"current": current, "latest": latest, "available": bool(latest) and version_tuple(latest) > version_tuple(current)}
+
+
 def schedule_power(action: str) -> str:
     if action not in ("reboot", "poweroff"):
         return "неизвестное действие"

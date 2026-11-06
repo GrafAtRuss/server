@@ -28,11 +28,12 @@ from hostadmin import (
     read_system,
     schedule_power,
     schedule_update,
+    update_offer,
     vm_catalog,
 )
 from ops import deliver, list_storage, probe, public_copy, run_vm, schedule_due
 
-PRODUCT_VERSION = "1.2.10"
+PRODUCT_VERSION = "1.2.11"
 LOGIN_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
 
 STATE_DIR = Path(os.environ.get("ONEC_STATE_DIR", "/var/lib/onec-console"))
@@ -317,7 +318,7 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as error:
                 self._send(400, {"error": str(error)})
             return
-        if path in ("/api/system", "/api/release", "/api/changelog"):
+        if path in ("/api/system", "/api/release", "/api/changelog", "/api/update"):
             user = self._guard(state)
             if not user:
                 return
@@ -325,6 +326,8 @@ class Handler(BaseHTTPRequestHandler):
                 payload = read_system()
             elif path == "/api/release":
                 payload = github_release()
+            elif path == "/api/update":
+                payload = update_offer(PRODUCT_VERSION)
             else:
                 payload = github_changelog()
             self._send(200, payload)
@@ -858,7 +861,11 @@ class Handler(BaseHTTPRequestHandler):
         self._send(200, {"ok": True, "detail": schedule_power(action)})
 
     def _update(self) -> None:
-        self._send(200, {"ok": True, "detail": schedule_update()})
+        offer = update_offer(PRODUCT_VERSION)
+        if not offer.get("available"):
+            self._send(400, {"error": f"На GitHub нет версии новее {PRODUCT_VERSION}."})
+            return
+        self._send(200, {"ok": True, "detail": schedule_update(), "version": offer.get("latest")})
 
     def _add_cluster(self) -> None:
         payload = self._read_json()

@@ -127,7 +127,7 @@
   <div id="boot" class="login"><p class="muted mono">Открываем консоль…</p></div>
   <form id="login" class="login hidden">
     <div class="card">
-      <p class="eyebrow">1.2.10</p>
+      <p class="eyebrow">1.2.11</p>
       <h1 style="margin-top:12px">Консоль платформы</h1>
       <label class="lbl" for="login-name">Логин</label>
       <input id="login-name" autocomplete="username" style="margin-top:8px" />
@@ -140,7 +140,7 @@
   <div id="app" class="shell hidden">
     <aside>
       <div>
-        <p class="eyebrow" style="color:var(--rail-dim)">1.2.10</p>
+        <p class="eyebrow" style="color:var(--rail-dim)">1.2.11</p>
         <p style="margin:4px 0 0;font-size:18px;font-weight:600">Консоль платформы</p>
       </div>
       <nav class="nav" style="overflow:auto">
@@ -311,10 +311,11 @@
         <div class="panel">
           <strong>Обслуживание</strong>
           <p class="muted">Обновление забирает код из GitHub и ставит новый пакет.</p>
+          <p id="update-state" class="muted">Проверяем GitHub…</p>
           <div class="stack">
             <button id="act-reboot" class="dark" type="button">Перезагрузить</button>
             <button id="act-off" class="ghost" type="button">Выключить</button>
-            <button id="act-update" class="primary" type="button">Обновить с GitHub</button>
+            <button id="act-update" class="primary hidden" type="button">Обновить</button>
           </div>
           <pre id="service-log" class="log">Команды выполняются на этой машине.</pre>
         </div>
@@ -722,6 +723,22 @@
         const data = await api("/api/system");
         if (data.updateLog) $("service-log").textContent = data.updateLog;
       } catch { /* журнал ещё пуст */ }
+      try {
+        const offer = await api("/api/update");
+        const button = $("act-update");
+        if (offer.available && offer.latest) {
+          button.classList.remove("hidden");
+          button.textContent = "Обновить до " + offer.latest;
+        } else {
+          button.classList.add("hidden");
+        }
+        $("update-state").textContent = offer.available
+          ? "Установлена " + offer.current + ". На GitHub есть " + offer.latest + "."
+          : "Установлена " + (offer.current || "") + ". Новее на GitHub нет.";
+      } catch (error) {
+        $("act-update").classList.add("hidden");
+        $("update-state").textContent = error.message;
+      }
     }
 
     $("sys-iface").addEventListener("change", () => {
