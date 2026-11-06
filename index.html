@@ -127,7 +127,7 @@
   <div id="boot" class="login"><p class="muted mono">Открываем консоль…</p></div>
   <form id="login" class="login hidden">
     <div class="card">
-      <p class="eyebrow">1.2.13</p>
+      <p class="eyebrow">1.2.14</p>
       <h1 style="margin-top:12px">Консоль платформы</h1>
       <label class="lbl" for="login-name">Логин</label>
       <input id="login-name" autocomplete="username" style="margin-top:8px" />
@@ -140,7 +140,7 @@
   <div id="app" class="shell hidden">
     <aside>
       <div>
-        <p class="eyebrow" style="color:var(--rail-dim)">1.2.13</p>
+        <p class="eyebrow" style="color:var(--rail-dim)">1.2.14</p>
         <p style="margin:4px 0 0;font-size:18px;font-weight:600">Консоль платформы</p>
       </div>
       <nav class="nav" style="overflow:auto">
@@ -447,7 +447,7 @@
         const when = sched.enabled ? days.filter((_, index) => (sched.days || []).includes(index)).join(" ") + " " + (sched.time || "") : "вручную";
         const place = job.folder ? "папка " + esc(job.folder) : "папка по умолчанию";
         const cloud = (job.copyIds || []).length ? " · облако " + esc(job.cloudFolder || job.folder || "/") : "";
-        return `<p>${when} · ${place}${cloud} · хранить ${sched.keepDays ?? 14} дн. <button class="ghost" type="button" data-run="${job.id}">Запустить</button> <button class="ghost" type="button" data-drop="backup-jobs:${job.id}">Удалить</button></p>`;
+        return `<p>${when} · ${place}${cloud} · хранить ${sched.keepDays ?? 14} дн. <button class="ghost" type="button" data-run="${job.id}">${job.running ? "Идёт…" : "Запустить"}</button> <button class="ghost" type="button" data-drop="backup-jobs:${job.id}">Удалить</button></p>${(job.lastLog || []).length ? `<pre class="log" style="min-height:0">${esc((job.lastLog || []).join("\n"))}</pre>` : ""}`;
       };
       const jobForm = (id, kind) => {
         const dayButtons = days.map((label, index) => `<button class="ghost" type="button" data-day="${index}" data-day-for="${id}" data-on="${index < 5 ? "1" : "0"}" style="${index < 5 ? "background:var(--pine);color:#fff" : ""}">${label}</button>`).join("");
@@ -1033,19 +1033,36 @@
         } catch { /* shown */ }
         return;
       }
-      const drop = event.target.dataset.drop;
-      if (drop) {
-        const [kind, id] = drop.split(":");
-        const extra = event.target.dataset.kind ? "&kind=" + event.target.dataset.kind : "";
+      const drop = event.target.closest("[data-drop]");
+      if (drop && drop.dataset.drop) {
+        const [kind, id] = drop.dataset.drop.split(":");
+        const extra = drop.dataset.kind ? "&kind=" + drop.dataset.kind : "";
         await api("/api/" + kind + "?id=" + encodeURIComponent(id) + extra, { method: "DELETE" });
         await refresh();
+        return;
       }
-      const run = event.target.dataset.run;
-      if (run) {
-        const result = await send("/api/backup-jobs/run", { id: run });
-        const text = (result.log || []).join("\n");
-        if ($("vm-log")) $("vm-log").textContent = text;
-        if ($("sql-log")) $("sql-log").textContent = text;
+      const runButton = event.target.closest("[data-run]");
+      if (runButton) {
+        event.preventDefault();
+        const run = runButton.dataset.run;
+        runButton.disabled = true;
+        $("form-error").textContent = "Запускаю резервное копирование…";
+        try {
+          const result = await send("/api/backup-jobs/run", { id: run });
+          let note = (result.log || ["запущено"]).join(" ");
+          $("form-error").textContent = note;
+          for (let step = 0; step < 30; step += 1) {
+            await new Promise((resolve) => setTimeout(resolve, 2000));
+            const state = await api("/api/state");
+            const job = (state.backupJobs || []).find((item) => item.id === run);
+            if (job && job.lastLog && job.lastLog.length) note = job.lastLog.join("\n");
+            if (!job || !job.running) break;
+          }
+          $("form-error").textContent = note;
+          await refresh();
+        } catch (error) {
+          $("form-error").textContent = error.message;
+        }
       }
     });
 

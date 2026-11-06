@@ -35,7 +35,7 @@ from hostadmin import (
 )
 from ops import deliver, list_storage, probe, public_copy, run_vm, schedule_due
 
-PRODUCT_VERSION = "1.2.13"
+PRODUCT_VERSION = "1.2.14"
 LOGIN_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
 
 STATE_DIR = Path(os.environ.get("ONEC_STATE_DIR", "/var/lib/onec-console"))
@@ -771,7 +771,7 @@ class Handler(BaseHTTPRequestHandler):
         name = str(payload.get("name", "")).strip()
         host = str(payload.get("host", "")).strip()
         login = str(payload.get("login", "")).strip()
-        secret = str(payload.get("secret", ""))
+        secret = str(payload.get("secret", "")).strip()
         kind = payload.get("kind")
         if kind not in ("esxi", "vsphere") or not name or not host or not login or not secret:
             self._send(400, {"error": "Заполните гипервизор, адрес, логин и пароль."})
@@ -1066,14 +1066,32 @@ class Handler(BaseHTTPRequestHandler):
         if not job:
             self._send(404, {"error": "Бекап не найден."})
             return
-        log = perform_backup(state, job)
         with LOCK:
             fresh = load_state()
             for item in fresh["backupJobs"]:
                 if item["id"] == job["id"]:
-                    item["lastLog"] = log
+                    if item.get("running"):
+                        self._send(200, {"log": ["уже выполняется"]})
+                        return
+                    item["running"] = True
+                    item["lastLog"] = ["запущено"]
             save_state(fresh)
-        self._send(200, {"log": log})
+
+        def work() -> None:
+            try:
+                log = perform_backup(state, job)
+            except Exception as error:
+                log = [str(error)]
+            with LOCK:
+                done = load_state()
+                for item in done["backupJobs"]:
+                    if item["id"] == job["id"]:
+                        item["running"] = False
+                        item["lastLog"] = log
+                save_state(done)
+
+        threading.Thread(target=work, daemon=True).start()
+        self._send(200, {"log": ["запущено"]})
 
 
 def read_schedule(value) -> dict:
@@ -1119,14 +1137,15 @@ def perform_backup(state: dict, job: dict) -> list:
                 return ["машина или гипервизор не найдены"]
             stamp, parent = open_backup(storage, folder, "vms", chosen["name"])
             vm_job = {**job, "vmName": chosen["name"], "stampDir": str(stamp)}
-            log = run_vm(vm_job, host, storage)
+            log = [f"папка создана: {parent}"]
+            log.extend(run_vm(vm_job, host, storage) or [])
         elif job["kind"] == "sql":
             chosen = next((item for item in state["chosenSql"] if item["id"] == job["targetId"]), None)
             sql_server = next((item for item in state["sqlServers"] if chosen and item["id"] == chosen["sourceId"]), None)
             if not chosen or not sql_server:
                 return ["база или сервер SQL не найдены"]
             stamp, parent = open_backup(storage, folder, "sql", chosen["name"])
-            log = [sql_backup(sql_server, chosen["name"], storage, stamp)]
+            log = [f"папка создана: {parent}", sql_backup(sql_server, chosen["name"], storage, stamp)]
         else:
             chosen = next((item for item in state["chosenBases"] if item["id"] == job["targetId"]), None)
             cluster = next((item for item in state["clusters"] if chosen and item["id"] == chosen["sourceId"]), None)
@@ -1138,7 +1157,7 @@ def perform_backup(state: dict, job: dict) -> list:
             binary = installed.get("binary")
             if os.environ.get("ONEC_PROBE") == "skip" or not binary:
                 (stamp / "config.cf").write_text(f"dump {target}\n", encoding="utf-8")
-                log = [f"бекап {target} → {stamp}"]
+                log = [f"папка создана: {parent}", f"бекап {target} → {stamp}"]
             else:
                 result = subprocess.run(
                     [
@@ -1147,7 +1166,7 @@ def perform_backup(state: dict, job: dict) -> list:
                     ],
                     text=True, capture_output=True, check=False, timeout=3600,
                 )
-                log = [f"бекап {target} → {stamp}", (result.stdout or result.stderr or "").strip()]
+                log = [f"папка создана: {parent}", f"бекап {target} → {stamp}", (result.stdout or result.stderr or "").strip()]
                 if result.returncode != 0:
                     log.append("Конфигуратор завершился с ошибкой")
                     return log

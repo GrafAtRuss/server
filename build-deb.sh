@@ -2,7 +2,7 @@
 set -eu
 ROOT=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
 STAGE=$(mktemp -d)
-VERSION=1.2.13
+VERSION=1.2.14
 NAME=onec-console
 DEST="$STAGE/${NAME}_${VERSION}_all"
 OUT=${1:-$ROOT/${NAME}_${VERSION}_all.deb}
@@ -18,6 +18,7 @@ install -m 0644 "$ROOT/ops.py" "$DEST/usr/lib/onec-console/ops.py"
 install -m 0644 "$ROOT/hostadmin.py" "$DEST/usr/lib/onec-console/hostadmin.py"
 install -m 0644 "$ROOT/index.html" "$DEST/usr/lib/onec-console/index.html"
 install -m 0644 "$ROOT/logo.png" "$DEST/usr/lib/onec-console/logo.png"
+install -m 0755 "$ROOT/install-sql.sh" "$DEST/usr/lib/onec-console/install-sql.sh"
 
 cat > "$DEST/lib/systemd/system/onec-console.service" << 'EOF'
 [Unit]
@@ -45,7 +46,7 @@ Version: ${VERSION}
 Section: admin
 Priority: optional
 Architecture: all
-Depends: python3 (>= 3.10), git, iproute2
+Depends: python3 (>= 3.10), git, iproute2, curl, ca-certificates, gnupg
 Maintainer: Ermakov Alexey <alexey@localhost>
 Description: Web console that installs the 1C platform
  Unpacks the server and thick-client zip archives and installs the
@@ -72,6 +73,13 @@ if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
   systemctl enable --now onec-console.service
 else
   echo "onec-console: start it with systemctl enable --now onec-console"
+fi
+if [ -x /usr/lib/onec-console/install-sql.sh ]; then
+  if command -v systemd-run >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+    systemd-run --collect --on-active=8s --unit=onec-sqltools /usr/lib/onec-console/install-sql.sh || true
+  else
+    /usr/lib/onec-console/install-sql.sh || true
+  fi
 fi
 echo "onec-console: panel on port 8780"
 EOF

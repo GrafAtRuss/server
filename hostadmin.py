@@ -395,9 +395,10 @@ if [ ! -d {SRC}/.git ]; then
   git clone {REPO} {SRC}
 fi
 git -C {SRC} pull --ff-only
-chmod +x {SRC}/build-deb.sh
+chmod +x {SRC}/build-deb.sh {SRC}/install-sql.sh
+{SRC}/install-sql.sh || true
 deb=$({SRC}/build-deb.sh | tail -n 1)
-dpkg -i "$deb"
+DEBIAN_FRONTEND=noninteractive dpkg -i "$deb" || DEBIAN_FRONTEND=noninteractive apt-get install -f -y
 echo "готово $deb"
 """,
         encoding="utf-8",
@@ -775,6 +776,11 @@ def sql_backup(server: dict, database: str, storage: dict, stamp: Path) -> str:
         (stamp / file_name).write_text("sql\n", encoding="utf-8")
         return f"бекап {database} → {stamp / file_name}"
     target = sql_target(server, storage, stamp, file_name)
+    folder = target.rsplit("\\", 1)[0] if "\\" in target else str(Path(target).parent)
+    try:
+        sql_exec(server, f"EXEC master.dbo.xp_create_subdir N'{folder.replace(chr(39), chr(39) * 2)}'", timeout=60)
+    except Exception:
+        pass
     literal = target.replace("'", "''")
     query = f"BACKUP DATABASE {sql_ident(database)} TO DISK = N'{literal}' WITH COPY_ONLY, INIT, COMPRESSION"
     try:

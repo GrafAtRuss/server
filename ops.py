@@ -448,6 +448,9 @@ def http_exchange(url: str, method: str, headers: dict, body: bytes = b"", keep_
         status = response.status
         location = response.getheader("Location")
         response_headers = {key.lower(): value for key, value in response.getheaders()}
+        cookies = [value for key, value in response.getheaders() if key.lower() == "set-cookie"]
+        if cookies:
+            response_headers["set-cookie"] = "; ".join(cookies)
         conn.close()
         if status in (301, 302, 303, 307, 308) and location:
             current = urllib.parse.urljoin(current, location)
@@ -460,49 +463,47 @@ def http_exchange(url: str, method: str, headers: dict, body: bytes = b"", keep_
 
 
 def vsphere_login(base: str, login: str, secret: str) -> tuple[str, str]:
-    """Сессия ESXi или vCenter. Заголовок входа сохраняется и после переадресации vSphere 7."""
-    token = b64encode(f"{login}:{secret}".encode()).decode()
+    """Сессия vCenter 7 или ESXi. Пароль не теряется на переадресации."""
+    secret = str(secret or "").strip()
     errors = []
-    attempts = (
-        ("/api", "/session", False),
-        ("/rest", "/com/vmware/cis/session", True),
-        ("/rest", "/com/vmware/cis/session", False),
-    )
-    for root, path, header_auth in attempts:
-        headers = {
-            "Authorization": f"Basic {token}",
-            "Accept": "application/json",
-            "User-Agent": "onec-console",
-        }
-        if header_auth:
-            headers["vmware-use-header-authn"] = "true"
-        url = base.rstrip("/") + root + path
-        try:
-            status, raw, _ = http_exchange(url, "POST", headers, b"", keep_method=True)
-        except Exception as error:
-            errors.append(f"{root}: {error}")
-            continue
-        text = raw.decode("utf-8", "replace").strip()
-        if status >= 400:
-            errors.append(f"{root} ответил {status}: {auth_detail(text)}")
-            continue
-        session = json.loads(text) if text.startswith("{") else text.strip('"')
-        if isinstance(session, dict):
-            session = session.get("value", "")
+    for user in login_variants(login):
+        session, curl_errors = curl_login(base, user, secret)
+        errors.extend(curl_errors)
         if session:
-            return str(session), root
-        errors.append(f"{root} не вернул сессию")
-    curl_session = curl_login(base, login, secret)
-    if curl_session:
-        return curl_session
+            return session
+        token = b64encode(f"{user}:{secret}".encode()).decode()
+        for root, path in (("/api", "/session"), ("/rest", "/com/vmware/cis/session")):
+            headers = {
+                "Authorization": f"Basic {token}",
+                "vmware-use-header-authn": "true",
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+                "User-Agent": "onec-console",
+            }
+            url = base.rstrip("/") + root + path
+            try:
+                status, raw, _ = http_exchange(url, "POST", headers, b"", keep_method=True)
+            except Exception as error:
+                errors.append(f"{root} {user}: {error}")
+                continue
+            text = raw.decode("utf-8", "replace").strip()
+            if status >= 400:
+                errors.append(f"{root} {user} ответил {status}: {auth_detail(text)}")
+                continue
+            session_id = json.loads(text) if text.startswith("{") else text.strip('"')
+            if isinstance(session_id, dict):
+                session_id = session_id.get("value", "")
+            if session_id:
+                return str(session_id), root
+            errors.append(f"{root} {user} не вернул сессию")
     raise RuntimeError("ESXi или vSphere не пустил: " + "; ".join(errors))
 
 
 def auth_detail(text: str) -> str:
-    if "authentication.invalid" in text or "Invalid credentials" in text or "Неверн" in text:
+    if "authentication.invalid" in text or "Invalid credentials" in text or "incorrect user name" in text.lower():
         return "логин или пароль не приняты"
     if "authentication.required" in text or "Authentication required" in text:
-        return "сервер не увидел пароль"
+        return "заголовок с паролем отклонён"
     compact = " ".join(text.split())
     return compact[:180] if compact else "пустой ответ"
 
@@ -510,26 +511,60 @@ def auth_detail(text: str) -> str:
 def curl_login(base: str, login: str, secret: str):
     curl = shutil_which("curl")
     if not curl:
-        return None
-    for path, root in (("/rest/com/vmware/cis/session", "/rest"), ("/api/session", "/api")):
+        return None, []
+    errors = []
+    for path, root in (("/api/session", "/api"), ("/rest/com/vmware/cis/session", "/rest")):
         result = subprocess.run(
             [
-                curl, "-sk", "--max-time", "20", "-u", f"{login}:{secret}",
-                "-H", "vmware-use-header-authn: true", "-H", "Accept: application/json",
-                "-X", "POST", "-w", "\n%{http_code}", base.rstrip("/") + path,
+                curl, "-sk", "--path-as-is", "--max-time", "20",
+                "--location-trusted", "--post301", "--post302", "--post303",
+                "-u", f"{login}:{secret}",
+                "-H", "vmware-use-header-authn: true",
+                "-H", "Accept: application/json",
+                "-H", "Content-Type: application/json",
+                "-X", "POST", "--data", "{}",
+                "-w", "\n%{http_code}", base.rstrip("/") + path,
             ],
             capture_output=True, text=True, timeout=25, check=False,
         )
         lines = (result.stdout or "").splitlines()
-        if not lines or lines[-1] != "200":
-            continue
+        code = lines[-1] if lines else ""
         raw = "\n".join(lines[:-1]).strip()
+        if code != "200" or not raw:
+            errors.append(f"curl {root} {code or result.returncode}: {auth_detail(raw or result.stderr or '')}")
+            continue
         session = json.loads(raw) if raw.startswith("{") else raw.strip('"')
         if isinstance(session, dict):
             session = session.get("value", "")
         if session:
-            return str(session), root
-    return None
+            return (str(session), root), []
+    return None, errors
+
+
+def login_variants(login: str) -> list:
+    login = str(login or "").strip()
+    names = []
+
+    def add(value: str) -> None:
+        value = value.strip()
+        if value and value not in names:
+            names.append(value)
+
+    add(login)
+    if "\\" in login:
+        domain, user = login.split("\\", 1)
+        add(f"{user}@{domain}")
+        add(user)
+    elif "@" in login:
+        add(login.split("@", 1)[0])
+    else:
+        add(f"{login}@vsphere.local")
+        add(f"vsphere.local\\{login}")
+    return names or [login]
+
+
+def login_names(login: str) -> list:
+    return login_variants(login)
 
 
 def list_vm_names(host: dict) -> list:
@@ -547,7 +582,9 @@ def connect_host(host: dict):
     try:
         return SoapHost.login(base, host["login"], host["secret"])
     except RuntimeError as error:
-        raise RuntimeError(f"{rest_error}. {error}") from error
+        secret = str(host.get("secret", ""))
+        hint = f" Логин «{host.get('login', '')}», длина пароля {len(secret)}."
+        raise RuntimeError(f"{rest_error}. {error}.{hint}") from error
 
 
 class RestHost:
@@ -581,6 +618,7 @@ class SoapHost:
         self.view_manager = view_manager
         self.root_folder = root_folder
         self.action = action
+        self.style = "plain"
         self.morefs = {}
 
     @classmethod
@@ -588,18 +626,24 @@ class SoapHost:
         content = ""
         action = ""
         errors = []
-        for candidate in ('"urn:vim25/7.0"', '"urn:vim25/6.7"', "urn:vim25/7.0", "urn:vim25"):
-            try:
-                content, _ = soap_call(
-                    base,
-                    "<urn:RetrieveServiceContent><urn:_this type=\"ServiceInstance\">ServiceInstance</urn:_this></urn:RetrieveServiceContent>",
-                    action=candidate,
-                )
-            except RuntimeError as error:
-                errors.append(str(error))
-                continue
-            if soap_value(content, "sessionManager"):
-                action = candidate
+        chosen = ""
+        for style in ("plain", "prefixed"):
+            for candidate in ('"urn:vim25/7.0"', '"urn:vim25/6.7"', '"urn:vim25/8.0"', "urn:vim25"):
+                try:
+                    content, _ = soap_call(
+                        base,
+                        "<urn:RetrieveServiceContent><urn:_this type=\"ServiceInstance\">ServiceInstance</urn:_this></urn:RetrieveServiceContent>",
+                        action=candidate,
+                        style=style,
+                    )
+                except RuntimeError as error:
+                    errors.append(str(error))
+                    continue
+                if soap_value(content, "sessionManager"):
+                    action = candidate
+                    chosen = style
+                    break
+            if action:
                 break
         if not action:
             raise RuntimeError(errors[-1] if errors else "ESXi SOAP не ответил")
@@ -609,18 +653,32 @@ class SoapHost:
         session_manager = soap_value(content, "sessionManager")
         if not collector or not session_manager:
             raise RuntimeError("ESXi SOAP не отдал службу входа")
-        _, cookie = soap_call(
-            base,
-            "<urn:Login>"
-            f"<urn:_this type=\"SessionManager\">{xml_escape(session_manager)}</urn:_this>"
-            f"<urn:userName>{xml_escape(login)}</urn:userName>"
-            f"<urn:password>{xml_escape(secret)}</urn:password>"
-            "</urn:Login>",
-            action=action,
-        )
-        if "vmware_soap_session" not in cookie:
-            raise RuntimeError("ESXi SOAP не открыл сессию")
-        return cls(base, cookie, collector, view_manager, root_folder, action)
+        cookie = ""
+        login_error = ""
+        styles = [chosen] if chosen else []
+        for extra in ("prefixed", "plain"):
+            if extra not in styles:
+                styles.append(extra)
+        for style in styles:
+            for user in login_variants(login):
+                body = (
+                    "<urn:Login>"
+                    f"<urn:_this type=\"SessionManager\">{xml_escape(session_manager)}</urn:_this>"
+                    f"<urn:userName>{xml_escape(user)}</urn:userName>"
+                    f"<urn:password><![CDATA[{secret.replace(']]>', ']]]]><![CDATA[>')}]]></urn:password>"
+                    "</urn:Login>"
+                )
+                try:
+                    _, cookie = soap_call(base, body, action=action, style=style)
+                except RuntimeError as error:
+                    login_error = f"{user}: {error}"
+                    continue
+                if "vmware_soap_session" in cookie:
+                    host = cls(base, cookie, collector, view_manager, root_folder, action)
+                    host.style = style
+                    return host
+                login_error = f"{user}: ESXi SOAP не открыл сессию"
+        raise RuntimeError(login_error or "ESXi SOAP не открыл сессию")
 
     def names(self) -> list:
         self.morefs = soap_vm_map(self)
@@ -628,7 +686,7 @@ class SoapHost:
 
     def shutdown(self, name: str) -> None:
         moref = self.moref(name)
-        soap_call(self.base, f"<urn:ShutdownGuest><urn:_this type=\"VirtualMachine\">{xml_escape(moref)}</urn:_this></urn:ShutdownGuest>", self.cookie, self.action)
+        soap_call(self.base, f"<urn:ShutdownGuest><urn:_this type=\"VirtualMachine\">{xml_escape(moref)}</urn:_this></urn:ShutdownGuest>", self.cookie, self.action, self.style)
 
     def wait_off(self, name: str) -> bool:
         moref = self.moref(name)
@@ -641,7 +699,7 @@ class SoapHost:
 
     def power_on(self, name: str) -> None:
         moref = self.moref(name)
-        soap_call(self.base, f"<urn:PowerOnVM_Task><urn:_this type=\"VirtualMachine\">{xml_escape(moref)}</urn:_this></urn:PowerOnVM_Task>", self.cookie, self.action)
+        soap_call(self.base, f"<urn:PowerOnVM_Task><urn:_this type=\"VirtualMachine\">{xml_escape(moref)}</urn:_this></urn:PowerOnVM_Task>", self.cookie, self.action, self.style)
 
     def moref(self, name: str) -> str:
         if name not in self.morefs:
@@ -651,12 +709,16 @@ class SoapHost:
         return self.morefs[name]
 
 
-def soap_call(base: str, body: str, cookie: str = "", action: str = '"urn:vim25/7.0"') -> tuple[str, str]:
+def soap_call(base: str, body: str, cookie: str = "", action: str = '"urn:vim25/7.0"', style: str = "plain") -> tuple[str, str]:
+    fragment = body
+    if style == "plain":
+        fragment = body.replace("<urn:", "<").replace("</urn:", "</")
+        fragment = re.sub(r"^(\s*<)(\w+)", r'\1\2 xmlns="urn:vim25"', fragment, count=1)
     xml = (
         '<?xml version="1.0" encoding="UTF-8"?>'
         '<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" '
         'xmlns:urn="urn:vim25" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">'
-        f"<soapenv:Body>{body}</soapenv:Body></soapenv:Envelope>"
+        f"<soapenv:Body>{fragment}</soapenv:Body></soapenv:Envelope>"
     ).encode()
     headers = {"Content-Type": "text/xml; charset=utf-8", "SOAPAction": action}
     if cookie:
@@ -689,6 +751,7 @@ def soap_vm_map(host: SoapHost) -> dict:
         "</urn:CreateContainerView>",
         host.cookie,
         host.action,
+        host.style,
     )
     view = soap_value(created, "returnval")
     if not view:
@@ -703,6 +766,7 @@ def soap_vm_map(host: SoapHost) -> dict:
         "</urn:objectSet></urn:specSet></urn:RetrieveProperties>",
         host.cookie,
         host.action,
+        host.style,
     )
     found = {}
     for block in re.findall(r"<(?:\w+:)?returnval>(.*?)</(?:\w+:)?returnval>", props, re.S):
@@ -723,6 +787,7 @@ def soap_power(host: SoapHost, moref: str) -> str:
         "</urn:RetrieveProperties>",
         host.cookie,
         host.action,
+        host.style,
     )
     return soap_value(payload, "val")
 
