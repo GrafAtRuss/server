@@ -2,7 +2,7 @@
 set -eu
 ROOT=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
 STAGE=$(mktemp -d)
-VERSION=1.2.2
+VERSION=1.2.3
 NAME=onec-console
 DEST="$STAGE/${NAME}_${VERSION}_all"
 OUT=${1:-$ROOT/${NAME}_${VERSION}_all.deb}
@@ -45,7 +45,7 @@ Version: ${VERSION}
 Section: admin
 Priority: optional
 Architecture: all
-Depends: python3 (>= 3.10)
+Depends: python3 (>= 3.10), git, iproute2
 Maintainer: Ermakov Alexey <alexey@localhost>
 Description: Web console that installs the 1C platform
  Unpacks the server and thick-client zip archives and installs the
@@ -81,7 +81,6 @@ cat > "$DEST/DEBIAN/prerm" << 'EOF'
 set -eu
 if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
   systemctl stop onec-console.service || true
-  systemctl disable onec-console.service || true
 fi
 EOF
 

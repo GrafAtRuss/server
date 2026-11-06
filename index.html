@@ -127,7 +127,7 @@
   <div id="boot" class="login"><p class="muted mono">Открываем консоль…</p></div>
   <form id="login" class="login hidden">
     <div class="card">
-      <p class="eyebrow">1.2.2</p>
+      <p class="eyebrow">1.2.3</p>
       <h1 style="margin-top:12px">Консоль платформы</h1>
       <label class="lbl" for="login-name">Логин</label>
       <input id="login-name" autocomplete="username" style="margin-top:8px" />
@@ -140,7 +140,7 @@
   <div id="app" class="shell hidden">
     <aside>
       <div>
-        <p class="eyebrow" style="color:var(--rail-dim)">1.2.2</p>
+        <p class="eyebrow" style="color:var(--rail-dim)">1.2.3</p>
         <p style="margin:4px 0 0;font-size:18px;font-weight:600">Консоль 1С</p>
       </div>
       <nav class="nav" style="overflow:auto">
@@ -258,7 +258,8 @@
           <strong>Имя и время</strong>
           <div class="stack">
             <input id="sys-host" name="hostname" placeholder="Имя хоста" />
-            <input id="sys-tz" name="timezone" placeholder="Europe/Moscow" />
+            <label class="lbl" for="sys-tz">Часовой пояс</label>
+            <select id="sys-tz"></select>
             <label class="lbl"><input id="sys-ntp" type="checkbox" /> NTP</label>
             <input id="sys-locale" name="locale" placeholder="ru_RU.UTF-8" />
             <button class="primary" type="submit">Сохранить</button>
@@ -266,16 +267,32 @@
         </form>
         <form id="net-form" class="panel">
           <strong>Сеть</strong>
-          <p id="sys-ip" class="mono muted"></p>
+          <div id="iface-list" class="stack"></div>
           <div class="stack">
+            <label class="lbl" for="sys-iface">Интерфейс</label>
+            <select id="sys-iface"></select>
+            <label class="lbl" for="sys-mode">Режим</label>
+            <select id="sys-mode"><option value="dhcp">DHCP</option><option value="static">Статический</option></select>
+            <input id="sys-addr" placeholder="Адрес 192.168.1.10/24" />
+            <input id="sys-gw" placeholder="Шлюз" />
             <input id="sys-dns" placeholder="DNS через пробел" />
-            <label class="lbl"><input id="sys-fw" type="checkbox" /> Фаервол</label>
-            <pre id="sys-fw-text" class="log"></pre>
-            <input id="sys-port" placeholder="Порт" />
-            <button id="port-open" class="ghost" type="button">Открыть порт</button>
-            <label class="lbl"><input id="sys-ssh" type="checkbox" /> SSH</label>
-            <button class="dark" type="submit">Применить сеть</button>
+            <button class="dark" type="submit">Применить к интерфейсу</button>
           </div>
+        </form>
+        <form id="fw-form" class="panel">
+          <strong>Фаервол</strong>
+          <label class="lbl"><input id="sys-fw" type="checkbox" /> Фаервол включён</label>
+          <label class="lbl"><input id="sys-ssh" type="checkbox" /> SSH</label>
+          <div id="fw-rules" class="stack"></div>
+          <div class="stack">
+            <select id="fw-action"><option value="allow">разрешить</option><option value="deny">запретить</option></select>
+            <input id="sys-port" placeholder="Порт" />
+            <select id="fw-proto"><option value="tcp">tcp</option><option value="udp">udp</option></select>
+            <input id="fw-from" placeholder="Откуда, пусто — отовсюду" />
+            <button id="port-open" class="ghost" type="button">Записать правило</button>
+            <button id="fw-switch" class="dark" type="button">Применить фаервол и SSH</button>
+          </div>
+          <p id="sys-msg"></p>
         </form>
       </section>
       <section id="tab-service" class="hidden">
@@ -436,7 +453,7 @@
           bases: "Сервер баз запоминается. Базу выбирают из списка. Бекапов может быть несколько.",
           storages: "Диски хранят бекапы. Облака получают дополнительную копию.",
           vms: "Гипервизор запоминается. Машину выбирают из списка.",
-          system: "Имя хоста, время, DNS, фаервол и SSH.",
+          system: "Имя хоста, пояс, адрес интерфейса, шлюз, DNS и правила фаервола.",
           service: "Перезагрузка, выключение и обновление с GitHub.",
           about: "Страница читает релиз из GitHub, а не из самой программы.",
           access: "Несколько операторов. Каждый меняет только свой пароль."
@@ -448,6 +465,7 @@
         $("title").textContent = titles[tab];
         $("lead").textContent = leads[tab];
         if (tab === "system") loadSystem();
+        if (tab === "service") loadUpdateLog();
         if (tab === "about") loadRelease();
       });
     });
@@ -585,21 +603,62 @@
       } catch { /* shown */ }
     });
 
+    function esc(text) {
+      return String(text ?? "").replace(/[&<>"']/g, (char) => {
+        if (char === "&") return "&" + "amp;";
+        if (char === "<") return "&" + "lt;";
+        if (char === ">") return "&" + "gt;";
+        if (char === '"') return "&" + "quot;";
+        return "&" + "#39;";
+      });
+    }
+
+    let nicCache = [];
+
+    function fillNic(nic) {
+      if (!nic) return;
+      $("sys-iface").value = nic.name;
+      $("sys-mode").value = nic.mode || "dhcp";
+      $("sys-addr").value = (nic.addresses || [])[0] || "";
+      $("sys-gw").value = nic.gateway || "";
+    }
+
     async function loadSystem() {
       try {
         const data = await api("/api/system");
         $("sys-host").value = data.hostname || "";
-        $("sys-tz").value = data.timezone || "";
-        $("sys-ntp").checked = Boolean(data.ntp);
+        const zones = data.timezones || [];
+        const current = data.timezone || "";
+        if (current && !zones.includes(current)) zones.unshift(current);
+        $("sys-tz").innerHTML = zones.map((zone) => `<option${zone === current ? " selected" : ""}>${esc(zone)}</option>`).join("");
+        const locale = String(data.locale || "").match(/LANG=([^\s]+)/);
+        $("sys-locale").value = locale ? locale[1] : (data.locale || "");
         $("sys-dns").value = (data.dns || []).join(" ");
         $("sys-fw").checked = Boolean(data.firewallActive);
-        $("sys-fw-text").textContent = data.firewall || "";
-        $("sys-ip").textContent = data.interfaces || "";
         $("sys-ssh").checked = data.ssh === "active";
+        const nics = data.nics || [];
+        nicCache = nics;
+        $("iface-list").innerHTML = nics.map((nic) => `<p><b>${esc(nic.name)}</b> <span class="muted">${esc(nic.state)}</span><br><span class="mono muted">${esc((nic.addresses || []).join(", ") || "адреса нет")} ${nic.gateway ? "· шлюз " + esc(nic.gateway) : ""}</span></p>`).join("") || "<p class='muted'>Интерфейсы не найдены.</p>";
+        const editable = nics.filter((nic) => nic.editable);
+        $("sys-iface").innerHTML = editable.map((nic) => `<option value="${esc(nic.name)}">${esc(nic.name)}</option>`).join("");
+        fillNic(editable[0]);
+        $("fw-rules").innerHTML = (data.firewallRules || []).map((rule, index) => `<div style="display:flex;justify-content:space-between;gap:12px;align-items:center"><span class="mono">${esc(rule.number || index + 1)}. ${esc(rule.text)}</span><span><button class="ghost" type="button" data-fw-edit="${esc(rule.number)}" data-fw-spec="${esc(rule.spec || "")}" data-fw-text="${esc(rule.text)}">Изменить</button> <button class="ghost" type="button" data-fw-del="${esc(rule.number)}" data-fw-spec="${esc(rule.spec || "")}">Удалить</button></span></div>`).join("") || "<p class='muted'>Правил пока нет.</p>";
+        if (data.updateLog) $("service-log").textContent = data.updateLog;
       } catch (error) {
-        $("form-error").textContent = error.message;
+        $("sys-msg").textContent = error.message;
       }
     }
+
+    async function loadUpdateLog() {
+      try {
+        const data = await api("/api/system");
+        if (data.updateLog) $("service-log").textContent = data.updateLog;
+      } catch { /* журнал ещё пуст */ }
+    }
+
+    $("sys-iface").addEventListener("change", () => {
+      fillNic(nicCache.find((nic) => nic.name === $("sys-iface").value));
+    });
 
     $("system-form").addEventListener("submit", async (event) => {
       event.preventDefault();
@@ -609,24 +668,84 @@
         await send("/api/system", { op: "ntp", value: $("sys-ntp").checked });
         await send("/api/system", { op: "locale", value: $("sys-locale").value });
         await loadSystem();
-      } catch { /* shown */ }
+        $("sys-msg").textContent = "Имя и время записаны.";
+      } catch (error) {
+        $("sys-msg").textContent = error.message;
+      }
     });
 
     $("net-form").addEventListener("submit", async (event) => {
       event.preventDefault();
       try {
-        await send("/api/system", { op: "dns", value: $("sys-dns").value });
+        const result = await send("/api/system", {
+          op: "address",
+          iface: $("sys-iface").value,
+          mode: $("sys-mode").value,
+          address: $("sys-addr").value,
+          gateway: $("sys-gw").value,
+          dns: $("sys-dns").value
+        });
+        $("sys-msg").textContent = result.detail || "Сеть применена.";
+        await loadSystem();
+      } catch (error) {
+        $("sys-msg").textContent = error.message;
+      }
+    });
+
+    $("fw-switch").addEventListener("click", async () => {
+      try {
         await send("/api/system", { op: "firewall", value: $("sys-fw").checked });
         await send("/api/system", { op: "ssh", value: $("sys-ssh").checked });
         await loadSystem();
-      } catch { /* shown */ }
+      } catch (error) {
+        $("sys-msg").textContent = error.message;
+      }
     });
 
     $("port-open").addEventListener("click", async () => {
       try {
-        await send("/api/system", { op: "firewall-allow", value: $("sys-port").value });
+        const result = await send("/api/system", {
+          op: "firewall-rule",
+          port: $("sys-port").value,
+          proto: $("fw-proto").value,
+          source: $("fw-from").value,
+          action: $("fw-action").value,
+          replace: $("port-open").dataset.replace || "",
+          spec: $("port-open").dataset.spec || ""
+        });
+        $("port-open").dataset.replace = "";
+        $("port-open").dataset.spec = "";
+        $("sys-msg").textContent = result.detail || "Правило записано.";
         await loadSystem();
-      } catch { /* shown */ }
+      } catch (error) {
+        $("sys-msg").textContent = error.message;
+      }
+    });
+
+    $("fw-rules").addEventListener("click", async (event) => {
+      const edit = event.target.dataset.fwEdit;
+      if (edit) {
+        const text = event.target.dataset.fwText || "";
+        const port = text.match(/(\d+)/);
+        $("sys-port").value = port ? port[1] : "";
+        $("fw-proto").value = /udp/i.test(text) ? "udp" : "tcp";
+        $("fw-action").value = /DENY|REJECT|deny/i.test(text) ? "deny" : "allow";
+        const from = text.match(/(\d+\.\d+\.\d+\.\d+(?:\/\d+)?)/);
+        $("fw-from").value = from && from[1] !== $("sys-port").value ? from[1] : "";
+        $("port-open").dataset.replace = edit;
+        $("port-open").dataset.spec = event.target.dataset.fwSpec || "";
+        $("sys-msg").textContent = "Правило " + edit + " будет заменено при записи.";
+        return;
+      }
+      const remove = event.target.dataset.fwDel;
+      if (!remove) return;
+      try {
+        const result = await send("/api/system", { op: "firewall-delete", number: remove, spec: event.target.dataset.fwSpec || "" });
+        $("sys-msg").textContent = result.detail || "Правило удалено.";
+        await loadSystem();
+      } catch (error) {
+        $("sys-msg").textContent = error.message;
+      }
     });
 
     async function power(action) {
@@ -636,8 +755,13 @@
     $("act-reboot").addEventListener("click", () => power("reboot"));
     $("act-off").addEventListener("click", () => power("poweroff"));
     $("act-update").addEventListener("click", async () => {
-      const result = await send("/api/update", {});
-      $("service-log").textContent = result.detail;
+      $("service-log").textContent = "Запускаю обновление…";
+      try {
+        const result = await send("/api/update", {});
+        $("service-log").textContent = result.detail;
+      } catch (error) {
+        $("service-log").textContent = error.message;
+      }
     });
 
     async function loadRelease() {
