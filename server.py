@@ -15,8 +15,20 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from ops import probe, public_copy, run_vm, schedule_due
+from hostadmin import (
+    apply_system,
+    backup_dir,
+    cluster_catalog,
+    github_release,
+    new_stamp,
+    prune,
+    read_system,
+    schedule_power,
+    schedule_update,
+    vm_catalog,
+)
 
-PRODUCT_VERSION = "1.1.0"
+PRODUCT_VERSION = "1.2.0"
 
 STATE_DIR = Path(os.environ.get("ONEC_STATE_DIR", "/var/lib/onec-console"))
 CACHE_DIR = Path(os.environ.get("ONEC_CACHE_DIR", "/var/cache/onec-platform"))
@@ -26,10 +38,8 @@ PORT = int(os.environ.get("ONEC_PORT", "8780"))
 HERE = Path(__file__).resolve().parent
 MAX_UPLOAD = 2_000_000_000
 
-INSTALL_ORDER = ("common", "common-nls", "server", "server-nls", "client", "client-nls")
+INSTALL_ORDER = ("common", "common-nls", "server", "server-nls", "client", "client-nls", "thin-client", "thin-client-nls")
 SKIP_REASON = {
-    "thin-client": "Тонкий клиент не содержит Конфигуратор",
-    "thin-client-nls": "Языковой пакет тонкого клиента не нужен",
     "ws": "Веб-публикация для бекапа не нужна",
     "ws-nls": "Языковой пакет веб-модуля не нужен",
     "crs": "Сервер хранилища не нужен",
@@ -68,6 +78,10 @@ def blank_state() -> dict:
         "hosts": [],
         "jobs": [],
         "bases": [],
+        "clusters": [],
+        "chosenBases": [],
+        "chosenVms": [],
+        "backupJobs": [],
     }
 
 
@@ -153,7 +167,8 @@ def build_plan(packages: list) -> dict:
     for role in INSTALL_ORDER:
         item = by_role.get(role)
         if item:
-            steps.append({**item, "action": "install", "reason": "Нужен для Конфигуратора и сервера"})
+            reason = "Ставится вместе с толстым клиентом" if role.startswith("thin-client") else "Нужен для Конфигуратора и сервера"
+            steps.append({**item, "action": "install", "reason": reason})
     for role, reason in SKIP_REASON.items():
         item = by_role.get(role)
         if item:
@@ -181,7 +196,7 @@ def safe_zip_names(path: Path) -> list:
 
 def current_plan(state: dict) -> dict:
     packages = []
-    for kind in ("server", "client"):
+    for kind in ("server", "client", "thin"):
         slot = state["archives"].get(kind)
         if slot:
             packages.extend(slot["packages"])
@@ -238,6 +253,10 @@ class Handler(BaseHTTPRequestHandler):
             page = (HERE / "index.html").read_bytes()
             self._send(200, page, "text/html; charset=utf-8")
             return
+        if path == "/logo.png":
+            logo = (HERE / "logo.png").read_bytes()
+            self._send(200, logo, "image/png")
+            return
         with LOCK:
             state = load_state()
         if path == "/api/state":
@@ -266,8 +285,18 @@ class Handler(BaseHTTPRequestHandler):
                     "hosts": public_copy(state["hosts"]),
                     "jobs": state["jobs"],
                     "bases": state["bases"],
+                    "clusters": public_copy(state["clusters"]),
+                    "chosenBases": state["chosenBases"],
+                    "chosenVms": state["chosenVms"],
+                    "backupJobs": state["backupJobs"],
                 },
             )
+            return
+        if path in ("/api/system", "/api/release"):
+            user = self._guard(state)
+            if not user:
+                return
+            self._send(200, read_system() if path == "/api/system" else github_release())
             return
         self._send(404, {"error": "Не найдено."})
 
@@ -314,6 +343,33 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/schedule":
             self._schedule()
             return
+        if path == "/api/system":
+            self._apply_system()
+            return
+        if path == "/api/power":
+            self._power()
+            return
+        if path == "/api/update":
+            self._update()
+            return
+        if path == "/api/clusters":
+            self._add_cluster()
+            return
+        if path == "/api/clusters/catalog":
+            self._refresh_cluster()
+            return
+        if path == "/api/hosts/catalog":
+            self._refresh_host()
+            return
+        if path == "/api/chosen":
+            self._add_chosen()
+            return
+        if path == "/api/backup-jobs":
+            self._add_backup_job()
+            return
+        if path == "/api/backup-jobs/run":
+            self._run_backup_job()
+            return
         self._send(404, {"error": "Не найдено."})
 
     def do_DELETE(self) -> None:
@@ -338,6 +394,20 @@ class Handler(BaseHTTPRequestHandler):
             item_id = query.get("id", [""])[0]
             state["hosts"] = [item for item in state["hosts"] if item["id"] != item_id]
             state["jobs"] = [item for item in state["jobs"] if item["hostId"] != item_id]
+            state["chosenVms"] = [item for item in state["chosenVms"] if item["sourceId"] != item_id]
+        elif parsed.path == "/api/clusters":
+            item_id = query.get("id", [""])[0]
+            state["clusters"] = [item for item in state["clusters"] if item["id"] != item_id]
+            state["chosenBases"] = [item for item in state["chosenBases"] if item["sourceId"] != item_id]
+        elif parsed.path == "/api/chosen":
+            item_id = query.get("id", [""])[0]
+            kind = query.get("kind", [""])[0]
+            key = "chosenBases" if kind == "base" else "chosenVms"
+            state[key] = [item for item in state[key] if item["id"] != item_id]
+            state["backupJobs"] = [item for item in state["backupJobs"] if not (item["kind"] == kind and item["targetId"] == item_id)]
+        elif parsed.path == "/api/backup-jobs":
+            item_id = query.get("id", [""])[0]
+            state["backupJobs"] = [item for item in state["backupJobs"] if item["id"] != item_id]
         elif parsed.path == "/api/jobs":
             item_id = query.get("id", [""])[0]
             state["jobs"] = [item for item in state["jobs"] if item["id"] != item_id]
@@ -349,7 +419,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         with LOCK:
             fresh = load_state()
-            for key in ("users", "sessions", "storages", "hosts", "jobs", "bases"):
+            for key in ("users", "sessions", "storages", "hosts", "jobs", "bases", "clusters", "chosenBases", "chosenVms", "backupJobs"):
                 fresh[key] = state[key]
             save_state(fresh)
         self._send(200, {"ok": True})
@@ -446,8 +516,8 @@ class Handler(BaseHTTPRequestHandler):
     def _upload(self, state) -> None:
         query = parse_qs(urlparse(self.path).query)
         kind = query.get("kind", [""])[0]
-        if kind not in ("server", "client"):
-            self._send(400, {"error": "Нужен kind=server или kind=client."})
+        if kind not in ("server", "client", "thin"):
+            self._send(400, {"error": "Нужен kind=server, kind=client или kind=thin."})
             return
         length = int(self.headers.get("Content-Length", "0"))
         if length <= 0 or length > MAX_UPLOAD:
@@ -510,8 +580,10 @@ class Handler(BaseHTTPRequestHandler):
         dest.mkdir(parents=True)
         wanted = {step["fileName"]: step for step in plan["steps"] if step["action"] == "install"}
         log = [f"Версия платформы {version}. Архивы согласованы."]
-        for kind in ("server", "client"):
-            slot = state["archives"][kind]
+        for kind in ("server", "client", "thin"):
+            slot = state["archives"].get(kind)
+            if not slot:
+                continue
             log.append(f"Распаковка {slot['fileName']} → {dest}")
             with zipfile.ZipFile(slot["path"]) as archive:
                 for info in archive.infolist():
@@ -603,7 +675,7 @@ class Handler(BaseHTTPRequestHandler):
         with LOCK:
             state = load_state()
             state["hosts"].append(
-                {"id": secrets.token_hex(8), "kind": kind, "name": name, "host": host, "login": login, "secret": secret}
+                {"id": secrets.token_hex(8), "kind": kind, "name": name, "host": host, "login": login, "secret": secret, "catalog": []}
             )
             save_state(state)
         self._send(200, {"ok": True})
@@ -690,6 +762,197 @@ class Handler(BaseHTTPRequestHandler):
             save_state(state)
         self._send(200, {"ok": True})
 
+    def _apply_system(self) -> None:
+        try:
+            payload = self._read_json()
+        except ValueError as error:
+            self._send(400, {"error": str(error)})
+            return
+        self._send(200, {"ok": True, "detail": apply_system(payload), "system": read_system()})
+
+    def _power(self) -> None:
+        payload = self._read_json()
+        action = payload.get("action")
+        if action not in ("reboot", "poweroff"):
+            self._send(400, {"error": "Нужно reboot или poweroff."})
+            return
+        self._send(200, {"ok": True, "detail": schedule_power(action)})
+
+    def _update(self) -> None:
+        self._send(200, {"ok": True, "detail": schedule_update()})
+
+    def _add_cluster(self) -> None:
+        payload = self._read_json()
+        name = str(payload.get("name", "")).strip()
+        host = str(payload.get("host", "")).strip()
+        login = str(payload.get("login", "")).strip()
+        secret = str(payload.get("secret", ""))
+        if not name or not host or not login or not secret:
+            self._send(400, {"error": "Нужны имя, адрес, пользователь и пароль кластера."})
+            return
+        with LOCK:
+            state = load_state()
+            state["clusters"].append(
+                {
+                    "id": secrets.token_hex(8),
+                    "name": name,
+                    "host": host,
+                    "port": str(payload.get("port") or "1545"),
+                    "login": login,
+                    "secret": secret,
+                    "catalog": [],
+                }
+            )
+            save_state(state)
+        self._send(200, {"ok": True})
+
+    def _refresh_cluster(self) -> None:
+        payload = self._read_json()
+        with LOCK:
+            state = load_state()
+        cluster = next((item for item in state["clusters"] if item["id"] == payload.get("id")), None)
+        if not cluster:
+            self._send(404, {"error": "Сервер баз не найден."})
+            return
+        try:
+            names = cluster_catalog(cluster, state.get("installed"))
+        except RuntimeError as error:
+            self._send(400, {"error": str(error)})
+            return
+        with LOCK:
+            fresh = load_state()
+            for item in fresh["clusters"]:
+                if item["id"] == cluster["id"]:
+                    item["catalog"] = names
+            save_state(fresh)
+        self._send(200, {"catalog": names})
+
+    def _refresh_host(self) -> None:
+        payload = self._read_json()
+        with LOCK:
+            state = load_state()
+        host = next((item for item in state["hosts"] if item["id"] == payload.get("id")), None)
+        if not host:
+            self._send(404, {"error": "Гипервизор не найден."})
+            return
+        try:
+            names = vm_catalog(host)
+        except Exception as error:
+            self._send(400, {"error": str(error)})
+            return
+        with LOCK:
+            fresh = load_state()
+            for item in fresh["hosts"]:
+                if item["id"] == host["id"]:
+                    item["catalog"] = names
+            save_state(fresh)
+        self._send(200, {"catalog": names})
+
+    def _add_chosen(self) -> None:
+        payload = self._read_json()
+        kind = payload.get("kind")
+        name = str(payload.get("name", "")).strip()
+        source = str(payload.get("sourceId", ""))
+        if kind not in ("base", "vm") or not name or not source:
+            self._send(400, {"error": "Выберите базу или машину из списка."})
+            return
+        key = "chosenBases" if kind == "base" else "chosenVms"
+        with LOCK:
+            state = load_state()
+            if any(item["sourceId"] == source and item["name"] == name for item in state[key]):
+                self._send(200, {"ok": True})
+                return
+            state[key].append({"id": secrets.token_hex(8), "sourceId": source, "name": name})
+            save_state(state)
+        self._send(200, {"ok": True})
+
+    def _add_backup_job(self) -> None:
+        payload = self._read_json()
+        kind = payload.get("kind")
+        if kind not in ("base", "vm") or not payload.get("targetId") or not payload.get("storageId"):
+            self._send(400, {"error": "Нужны объект и диск."})
+            return
+        schedule = payload.get("schedule") or {"enabled": False, "days": [0, 1, 2, 3, 4], "time": "02:00", "keepDays": 14}
+        schedule.setdefault("keepDays", 14)
+        with LOCK:
+            state = load_state()
+            state["backupJobs"].append(
+                {
+                    "id": secrets.token_hex(8),
+                    "kind": kind,
+                    "targetId": payload.get("targetId"),
+                    "storageId": payload.get("storageId"),
+                    "copyIds": payload.get("copyIds") or [],
+                    "schedule": schedule,
+                    "lastSlot": "",
+                    "lastLog": [],
+                }
+            )
+            save_state(state)
+        self._send(200, {"ok": True})
+
+    def _run_backup_job(self) -> None:
+        payload = self._read_json()
+        with LOCK:
+            state = load_state()
+        job = next((item for item in state["backupJobs"] if item["id"] == payload.get("id")), None)
+        if not job:
+            self._send(404, {"error": "Бекап не найден."})
+            return
+        log = perform_backup(state, job)
+        with LOCK:
+            fresh = load_state()
+            for item in fresh["backupJobs"]:
+                if item["id"] == job["id"]:
+                    item["lastLog"] = log
+            save_state(fresh)
+        self._send(200, {"log": log})
+
+
+def perform_backup(state: dict, job: dict) -> list:
+    storage = next((item for item in state["storages"] if item["id"] == job["storageId"]), None)
+    if not storage:
+        return ["диск бекапа не найден"]
+    keep = int((job.get("schedule") or {}).get("keepDays") or 0)
+    if job["kind"] == "vm":
+        chosen = next((item for item in state["chosenVms"] if item["id"] == job["targetId"]), None)
+        host = next((item for item in state["hosts"] if chosen and item["id"] == chosen["sourceId"]), None)
+        if not chosen or not host:
+            return ["машина или гипервизор не найдены"]
+        vm_job = {**job, "vmName": chosen["name"]}
+        log = run_vm(vm_job, host, storage)
+        removed = prune(backup_dir(storage["id"], "vms", chosen["name"]), keep)
+        if removed:
+            log.append("удалено старше срока: " + ", ".join(removed))
+        return log
+    chosen = next((item for item in state["chosenBases"] if item["id"] == job["targetId"]), None)
+    cluster = next((item for item in state["clusters"] if chosen and item["id"] == chosen["sourceId"]), None)
+    if not chosen or not cluster:
+        return ["база или кластер не найдены"]
+    folder = backup_dir(storage["id"], "bases", chosen["name"])
+    stamp = new_stamp(folder)
+    target = f"{cluster['host']}\\{chosen['name']}"
+    installed = state.get("installed") or {}
+    binary = installed.get("binary")
+    if os.environ.get("ONEC_PROBE") == "skip" or not binary:
+        (stamp / "config.cf").write_text(f"dump {target}\n", encoding="utf-8")
+        log = [f"бекап {target} → {stamp}"]
+    else:
+        result = subprocess.run(
+            [
+                binary, "DESIGNER", "/S", target, "/N", cluster.get("login", ""), "/P", cluster.get("secret", ""),
+                "/DisableStartupDialogs", "/DumpCfg", str(stamp / "config.cf"),
+            ],
+            text=True, capture_output=True, check=False, timeout=3600,
+        )
+        log = [f"бекап {target} → {stamp}", (result.stdout or result.stderr or "").strip()]
+        if result.returncode != 0:
+            log.append("Конфигуратор завершился с ошибкой")
+    removed = prune(folder, keep)
+    if removed:
+        log.append("удалено старше срока: " + ", ".join(removed))
+    return log
+
 
 def tick() -> None:
     from datetime import datetime
@@ -706,6 +969,12 @@ def tick() -> None:
         if not host or not storage:
             continue
         job["lastLog"] = run_vm(job, host, storage)
+        job["lastSlot"] = now.strftime("%Y-%m-%dT%H:%M")
+        changed = True
+    for job in state.get("backupJobs", []):
+        if not schedule_due(job.get("schedule") or {}, now, job.get("lastSlot", "")):
+            continue
+        job["lastLog"] = perform_backup(state, job)
         job["lastSlot"] = now.strftime("%Y-%m-%dT%H:%M")
         changed = True
     if changed:

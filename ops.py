@@ -118,12 +118,12 @@ def run_vm(job: dict, host: dict, storage: dict) -> list:
         turned_off = True
         log.append("машина выключена")
         folder = MOUNT_ROOT / storage["id"] / "vms" / safe_name(job["vmName"])
-        folder.mkdir(parents=True, exist_ok=True)
-        stamp = datetime.now().strftime("%Y%m%d-%H%M")
-        note = folder / f"{stamp}.txt"
+        stamp_dir = folder / datetime.now().strftime("%Y%m%d-%H%M%S")
+        stamp_dir.mkdir(parents=True, exist_ok=True)
+        note = stamp_dir / "backup.txt"
         note.write_text(f"{job['vmName']} off, host {host['host']}\n", encoding="utf-8")
         log.append(f"отметка бекапа {note}")
-        copied = copy_vm_files(host, job["vmName"], folder)
+        copied = copy_vm_files(host, job["vmName"], stamp_dir)
         log.append(copied)
     except Exception as error:
         log.append(str(error))
@@ -172,7 +172,12 @@ def shutil_which(name: str):
     return which(name)
 
 
-def vsphere_login(base: str, login: str, secret: str):
+def list_vm_names(host: dict) -> list:
+    base = host["host"] if str(host["host"]).startswith("http") else "https://" + host["host"]
+    session, root = vsphere_login(base, host["login"], host["secret"])
+    payload = api(base, root, session, "/vcenter/vm")
+    rows = payload.get("value", payload) if isinstance(payload, dict) else payload
+    return [row.get("name") for row in rows or [] if row.get("name")]
     token = b64encode(f"{login}:{secret}".encode()).decode()
     for root in ("/api", "/rest"):
         request = urllib.request.Request(

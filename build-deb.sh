@@ -2,7 +2,7 @@
 set -eu
 ROOT=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
 STAGE=$(mktemp -d)
-VERSION=1.1.0
+VERSION=1.2.0
 NAME=onec-console
 DEST="$STAGE/${NAME}_${VERSION}_all"
 OUT=${1:-$ROOT/${NAME}_${VERSION}_all.deb}
@@ -15,7 +15,9 @@ mkdir -p "$DEST/DEBIAN" \
 
 install -m 0644 "$ROOT/server.py" "$DEST/usr/lib/onec-console/server.py"
 install -m 0644 "$ROOT/ops.py" "$DEST/usr/lib/onec-console/ops.py"
+install -m 0644 "$ROOT/hostadmin.py" "$DEST/usr/lib/onec-console/hostadmin.py"
 install -m 0644 "$ROOT/index.html" "$DEST/usr/lib/onec-console/index.html"
+install -m 0644 "$ROOT/logo.png" "$DEST/usr/lib/onec-console/logo.png"
 
 cat > "$DEST/lib/systemd/system/onec-console.service" << 'EOF'
 [Unit]

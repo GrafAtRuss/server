@@ -127,7 +127,7 @@
   <div id="boot" class="login"><p class="muted mono">Открываем консоль…</p></div>
   <form id="login" class="login hidden">
     <div class="card">
-      <p class="eyebrow">1.1.0</p>
+      <p class="eyebrow">1.2.0</p>
       <h1 style="margin-top:12px">Консоль платформы</h1>
       <label class="lbl" for="login-name">Логин</label>
       <input id="login-name" autocomplete="username" style="margin-top:8px" />
@@ -140,14 +140,17 @@
   <div id="app" class="shell hidden">
     <aside>
       <div>
-        <p class="eyebrow" style="color:var(--rail-dim)">1.1.0</p>
+        <p class="eyebrow" style="color:var(--rail-dim)">1.2.0</p>
         <p style="margin:4px 0 0;font-size:18px;font-weight:600">Консоль 1С</p>
       </div>
-      <nav class="nav">
+      <nav class="nav" style="overflow:auto">
         <button type="button" data-tab="platform" class="on">Установка</button>
         <button type="button" data-tab="bases">Базы</button>
-        <button type="button" data-tab="storages">Хранилища</button>
-        <button type="button" data-tab="vms">Виртмашины</button>
+        <button type="button" data-tab="storages">Диски</button>
+        <button type="button" data-tab="vms">Машины</button>
+        <button type="button" data-tab="system">Система</button>
+        <button type="button" data-tab="service">Обслуживание</button>
+        <button type="button" data-tab="about">Релиз</button>
         <button type="button" data-tab="access">Доступ</button>
       </nav>
       <div class="who">
@@ -160,7 +163,7 @@
       <div class="head">
         <div>
           <h1 id="title">Установка платформы</h1>
-          <p id="lead" class="muted">Архивы сервера и клиента разбираются сами. Пакеты ставятся в порядке зависимостей.</p>
+          <p id="lead" class="muted">Сервер, толстый и тонкий клиент ставятся одним запуском.</p>
           <p id="form-error" class="danger"></p>
         </div>
         <span id="pill" class="pill wait">Платформа не установлена</span>
@@ -178,13 +181,18 @@
               <p id="client-name" class="mono muted">архив не загружен</p>
               <label class="file ghost">Загрузить архив<input id="client-file" type="file" accept=".zip,application/zip" hidden /></label>
             </div>
+            <div class="slot">
+              <strong>Тонкий клиент</strong>
+              <p id="thin-name" class="mono muted">необязательно</p>
+              <label class="file ghost">Загрузить архив<input id="thin-file" type="file" accept=".zip,application/zip" hidden /></label>
+            </div>
           </div>
           <p id="plan-error" class="danger"></p>
           <ol id="plan"></ol>
           <button id="install" class="primary" type="button">Установить автоматически</button>
           <p id="done" class="hidden" style="color:var(--pine)"></p>
         </div>
-        <pre id="log" class="log">Ожидание запуска. Порядок: common → server → client.</pre>
+        <pre id="log" class="log">Ожидание запуска. Порядок: common → server → client → thin-client.</pre>
       </section>
       <section id="tab-storages" class="hidden grid">
         <form id="disk-form" class="panel" data-role="disk">
@@ -217,45 +225,88 @@
       <section id="tab-vms" class="hidden grid">
         <form id="host-form" class="panel">
           <strong>Гипервизор</strong>
+          <p class="muted">Запоминается. Машину потом выбирают из списка.</p>
           <div class="stack">
             <select name="kind"><option value="esxi">ESXi</option><option value="vsphere">vSphere</option></select>
             <input name="name" placeholder="Имя подключения" />
             <input name="host" placeholder="esxi.example или vcenter.example" />
             <input name="login" placeholder="Логин" />
             <input name="secret" type="password" placeholder="Пароль" />
-            <button class="dark" type="submit">Подключить</button>
+            <button class="dark" type="submit">Запомнить</button>
           </div>
-          <ul id="host-list" style="list-style:none;padding:0"></ul>
-        </form>
-        <form id="job-form" class="panel">
-          <strong>Бекап машины</strong>
-          <p class="muted">Перед копированием машина мягко выключается, после копии включается.</p>
-          <div class="stack">
-            <select id="job-host" name="hostId"></select>
-            <input name="vmName" placeholder="Имя виртуальной машины" />
-            <select id="job-disk" name="storageId"></select>
-            <input name="time" type="time" value="02:00" />
-            <label class="lbl"><input id="job-enabled" type="checkbox" /> По расписанию, будни</label>
-            <button class="primary" type="submit">Добавить бекап</button>
-          </div>
-          <ul id="job-list" style="list-style:none;padding:0"></ul>
+          <div id="host-list"></div>
         </form>
         <pre id="vm-log" class="log">Журнал выключения, копии и включения появится здесь.</pre>
       </section>
       <section id="tab-bases" class="hidden">
-        <form id="base-form" class="panel">
-          <strong>Информационная база</strong>
+        <form id="cluster-form" class="panel">
+          <strong>Сервер баз</strong>
+          <p class="muted">Кластер запоминается. Базу выбирают из списка rac, а не вводят руками.</p>
           <div class="stack">
-            <input name="name" placeholder="Имя базы" />
-            <select name="kind"><option value="server">Серверная</option><option value="file">Файловая</option></select>
-            <input name="target" placeholder="localhost\trade или путь к файловой базе" />
-            <select id="base-disk" name="storageId"></select>
-            <input name="time" type="time" value="02:00" />
-            <label class="lbl"><input id="base-enabled" type="checkbox" /> По расписанию, будни</label>
-            <button class="dark" type="submit">Добавить базу</button>
+            <input name="name" placeholder="Имя подключения" />
+            <input name="host" placeholder="srv-1c" />
+            <input name="port" value="1545" />
+            <input name="login" placeholder="Пользователь кластера" />
+            <input name="secret" type="password" placeholder="Пароль" />
+            <button class="dark" type="submit">Запомнить сервер</button>
           </div>
-          <ul id="base-list" style="list-style:none;padding:0"></ul>
+          <div id="cluster-list"></div>
         </form>
+      </section>
+      <section id="tab-system" class="hidden grid">
+        <form id="system-form" class="panel">
+          <strong>Имя и время</strong>
+          <div class="stack">
+            <input id="sys-host" name="hostname" placeholder="Имя хоста" />
+            <input id="sys-tz" name="timezone" placeholder="Europe/Moscow" />
+            <label class="lbl"><input id="sys-ntp" type="checkbox" /> NTP</label>
+            <input id="sys-locale" name="locale" placeholder="ru_RU.UTF-8" />
+            <button class="primary" type="submit">Сохранить</button>
+          </div>
+        </form>
+        <form id="net-form" class="panel">
+          <strong>Сеть</strong>
+          <p id="sys-ip" class="mono muted"></p>
+          <div class="stack">
+            <input id="sys-dns" placeholder="DNS через пробел" />
+            <label class="lbl"><input id="sys-fw" type="checkbox" /> Фаервол</label>
+            <pre id="sys-fw-text" class="log"></pre>
+            <input id="sys-port" placeholder="Порт" />
+            <button id="port-open" class="ghost" type="button">Открыть порт</button>
+            <label class="lbl"><input id="sys-ssh" type="checkbox" /> SSH</label>
+            <button class="dark" type="submit">Применить сеть</button>
+          </div>
+        </form>
+      </section>
+      <section id="tab-service" class="hidden">
+        <div class="panel">
+          <strong>Обслуживание</strong>
+          <p class="muted">Обновление забирает код из GitHub и ставит новый пакет.</p>
+          <div class="stack">
+            <button id="act-reboot" class="dark" type="button">Перезагрузить</button>
+            <button id="act-off" class="ghost" type="button">Выключить</button>
+            <button id="act-update" class="primary" type="button">Обновить с GitHub</button>
+          </div>
+          <pre id="service-log" class="log">Команды выполняются на этой машине.</pre>
+        </div>
+      </section>
+      <section id="tab-about" class="hidden grid">
+        <div class="panel">
+          <strong>Текущий релиз на GitHub</strong>
+          <p id="rel-title" class="mono" style="color:var(--copper)"></p>
+          <p id="rel-when" class="muted"></p>
+          <p id="rel-body" style="white-space:pre-wrap"></p>
+          <a id="rel-url" href="https://github.com/GrafAtRuss/server">Открыть на GitHub</a>
+        </div>
+        <aside class="panel" style="background:var(--rail);color:var(--rail-fg)">
+          <div style="display:inline-block;background:#fff;border-radius:12px;padding:12px">
+            <img src="/logo.png" alt="Логотип ИП Ермаков" style="height:64px" />
+          </div>
+          <p>Автор — ИП Ермаков А.С.</p>
+          <p><a href="https://ип-ермаков.рф/" style="color:inherit">ип-ермаков.рф</a></p>
+          <p><a href="mailto:Info@ip-ermakov.ru" style="color:inherit">Info@ip-ermakov.ru</a></p>
+          <p><a href="tel:+79918661848" style="color:inherit">+7-991-866-1848</a></p>
+        </aside>
       </section>
       <section id="tab-access" class="hidden">
         <div class="forms">
@@ -308,10 +359,10 @@
       $("who-name").textContent = state.me.name;
       $("who-login").textContent = state.me.login;
       $("must").classList.toggle("hidden", !state.me.mustChange);
-      const server = state.archives.server;
-      const client = state.archives.client;
+      const thin = state.archives.thin;
       $("server-name").textContent = server ? server.fileName + " · " + server.count : "архив не загружен";
       $("client-name").textContent = client ? client.fileName + " · " + client.count : "архив не загружен";
+      $("thin-name").textContent = thin ? thin.fileName + " · " + thin.count : "необязательно";
       $("plan-error").textContent = state.plan.error || "";
       $("plan").innerHTML = (state.plan.steps || []).map((step) => {
         const skip = step.action === "skip";
@@ -324,18 +375,24 @@
         $("done").classList.remove("hidden");
         $("done").textContent = "Установлено. Конфигуратор: " + state.installed.binary;
       }
-      $("log").textContent = (state.log || []).join("\n") || "Ожидание запуска. Порядок: common → server → client.";
+      $("log").textContent = (state.log || []).join("\n") || "Ожидание запуска. Порядок: common → server → client → thin-client.";
       const disks = (state.storages || []).filter((item) => item.role === "disk");
-      const clouds = (state.storages || []).filter((item) => item.role === "cloud");
-      const row = (item, action) => `<li style="display:flex;justify-content:space-between;gap:12px;padding:10px 0;border-bottom:1px solid var(--line)"><span>${item.name}<br><span class="mono muted">${item.detail || item.host || item.endpoint || ""}</span></span><button class="ghost" type="button" data-drop="${action}:${item.id}">Удалить</button></li>`;
-      $("disk-list").innerHTML = disks.map((item) => row(item, "storages")).join("") || "<li class='muted'>Пока ничего не подключено.</li>";
-      $("cloud-list").innerHTML = clouds.map((item) => row(item, "storages")).join("") || "<li class='muted'>Пока ничего не подключено.</li>";
-      $("host-list").innerHTML = (state.hosts || []).map((item) => row(item, "hosts")).join("") || "<li class='muted'>Гипервизоры не подключены.</li>";
-      $("job-host").innerHTML = "<option value=''>Гипервизор</option>" + (state.hosts || []).map((item) => `<option value="${item.id}">${item.name}</option>`).join("");
-      $("job-disk").innerHTML = "<option value=''>Диск для бекапа</option>" + disks.map((item) => `<option value="${item.id}">${item.name}</option>`).join("");
-      $("base-disk").innerHTML = $("job-disk").innerHTML;
-      $("job-list").innerHTML = (state.jobs || []).map((job) => `<li style="padding:10px 0;border-bottom:1px solid var(--line)"><b>${job.vmName}</b> <span class="muted">${job.schedule && job.schedule.enabled ? job.schedule.time : "без расписания"}</span> <button class="ghost" type="button" data-run="${job.id}">Запустить</button> <button class="ghost" type="button" data-drop="jobs:${job.id}">Удалить</button></li>`).join("");
-      $("base-list").innerHTML = (state.bases || []).map((base) => `<li style="padding:10px 0;border-bottom:1px solid var(--line)"><b>${base.name}</b> <span class="muted">${base.schedule && base.schedule.enabled ? base.schedule.time : "без расписания"}</span> <button class="ghost" type="button" data-drop="bases:${base.id}">Удалить</button></li>`).join("");
+      const row = (item, action) => `<div style="display:flex;justify-content:space-between;gap:12px;padding:10px 0;border-bottom:1px solid var(--line)"><span>${item.name}<br><span class="mono muted">${item.detail || item.host || item.endpoint || ""}</span></span><button class="ghost" type="button" data-drop="${action}:${item.id}">Удалить</button></div>`;
+      $("disk-list").innerHTML = disks.map((item) => row(item, "storages")).join("") || "<p class='muted'>Пока ничего не подключено.</p>";
+      $("cloud-list").innerHTML = (state.storages || []).filter((item) => item.role === "cloud").map((item) => row(item, "storages")).join("") || "<p class='muted'>Пока ничего не подключено.</p>";
+      const diskOptions = disks.map((item) => `<option value="${item.id}">${item.name}</option>`).join("");
+      const jobsOf = (kind, id) => (state.backupJobs || []).filter((job) => job.kind === kind && job.targetId === id);
+      const jobHtml = (job) => `<p>${job.schedule && job.schedule.enabled ? job.schedule.time : "вручную"} · хранить ${job.schedule ? job.schedule.keepDays : 14} дн. <button class="ghost" type="button" data-run="${job.id}">Запустить</button> <button class="ghost" type="button" data-drop="backup-jobs:${job.id}">Удалить</button></p>`;
+      $("host-list").innerHTML = (state.hosts || []).map((item) => {
+        const options = (item.catalog || []).map((name) => `<option>${name}</option>`).join("");
+        const chosen = (state.chosenVms || []).filter((vm) => vm.sourceId === item.id).map((vm) => `<div style="margin-top:12px"><b>${vm.name}</b> <button class="ghost" type="button" data-drop="chosen:${vm.id}" data-kind="vm">Убрать</button>${jobsOf("vm", vm.id).map(jobHtml).join("")}<div class="stack"><select data-disk="${vm.id}">${diskOptions}</select><input data-keep="${vm.id}" type="number" value="14" /><button class="primary" type="button" data-add="vm" data-target="${vm.id}">Добавить бекап</button></div></div>`).join("");
+        return `${row(item, "hosts")}<div class="stack"><button class="ghost" type="button" data-catalog="hosts" data-id="${item.id}">Обновить список</button><select data-pick="${item.id}">${options}</select><button class="dark" type="button" data-take="vm" data-source="${item.id}">Взять в работу</button></div>${chosen}`;
+      }).join("") || "<p class='muted'>Гипервизоры не подключены.</p>";
+      $("cluster-list").innerHTML = (state.clusters || []).map((item) => {
+        const options = (item.catalog || []).map((name) => `<option>${name}</option>`).join("");
+        const chosen = (state.chosenBases || []).filter((base) => base.sourceId === item.id).map((base) => `<div style="margin-top:12px"><b>${base.name}</b> <button class="ghost" type="button" data-drop="chosen:${base.id}" data-kind="base">Убрать</button>${jobsOf("base", base.id).map(jobHtml).join("")}<div class="stack"><select data-disk="${base.id}">${diskOptions}</select><input data-keep="${base.id}" type="number" value="14" /><button class="primary" type="button" data-add="base" data-target="${base.id}">Добавить бекап</button></div></div>`).join("");
+        return `${row(item, "clusters")}<p class="mono muted">${item.host}:${item.port}</p><div class="stack"><button class="ghost" type="button" data-catalog="clusters" data-id="${item.id}">Обновить список</button><select data-pick="${item.id}">${options}</select><button class="dark" type="button" data-take="base" data-source="${item.id}">Взять в работу</button></div>${chosen}`;
+      }).join("") || "<p class='muted'>Серверы баз не подключены.</p>";
       $("users").innerHTML = state.users.map((user) => `<li style="display:flex;justify-content:space-between;gap:12px;padding:12px 0;border-bottom:1px solid var(--line)"><span>${user.name}<br><span class="mono muted">${user.login}</span></span>${user.login === state.me.login ? "<span class='muted'>это вы</span>" : `<button class="ghost" data-remove="${user.login}" type="button">Удалить</button>`}</li>`).join("");
     }
 
@@ -366,20 +423,28 @@
     document.querySelectorAll("[data-tab]").forEach((button) => {
       button.addEventListener("click", () => {
         document.querySelectorAll("[data-tab]").forEach((item) => item.classList.toggle("on", item === button));
-        const titles = { platform: "Установка платформы", bases: "Информационные базы", storages: "Хранилища", vms: "Виртуальные машины", access: "Операторы" };
+        const titles = {
+          platform: "Установка платформы", bases: "Информационные базы", storages: "Хранилища",
+          vms: "Виртуальные машины", system: "Система и сеть", service: "Обслуживание", about: "Релиз", access: "Операторы"
+        };
         const leads = {
-          platform: "Архивы сервера и клиента разбираются сами. Пакеты ставятся в порядке зависимостей.",
-          bases: "У каждой базы своё расписание, диск и облачные копии.",
+          platform: "Сервер, толстый и тонкий клиент ставятся одним запуском.",
+          bases: "Сервер баз запоминается. Базу выбирают из списка. Бекапов может быть несколько.",
           storages: "Диски хранят бекапы. Облака получают дополнительную копию.",
-          vms: "Машина мягко выключается, копируется и снова включается.",
+          vms: "Гипервизор запоминается. Машину выбирают из списка.",
+          system: "Имя хоста, время, DNS, фаервол и SSH.",
+          service: "Перезагрузка, выключение и обновление с GitHub.",
+          about: "Страница читает релиз из GitHub, а не из самой программы.",
           access: "Несколько операторов. Каждый меняет только свой пароль."
         };
         const tab = button.dataset.tab;
-        ["platform", "bases", "storages", "vms", "access"].forEach((name) => {
+        ["platform", "bases", "storages", "vms", "system", "service", "about", "access"].forEach((name) => {
           $("tab-" + name).classList.toggle("hidden", name !== tab);
         });
         $("title").textContent = titles[tab];
         $("lead").textContent = leads[tab];
+        if (tab === "system") loadSystem();
+        if (tab === "about") loadRelease();
       });
     });
 
@@ -409,6 +474,11 @@
     $("client-file").addEventListener("change", (event) => {
       const file = event.target.files[0];
       if (file) upload("client", file);
+      event.target.value = "";
+    });
+    $("thin-file").addEventListener("change", (event) => {
+      const file = event.target.files[0];
+      if (file) upload("thin", file);
       event.target.value = "";
     });
 
@@ -501,40 +571,129 @@
       } catch { /* shown */ }
     });
 
-    $("job-form").addEventListener("submit", async (event) => {
+    $("cluster-form").addEventListener("submit", async (event) => {
       event.preventDefault();
       const body = Object.fromEntries(new FormData(event.target).entries());
-      body.schedule = { enabled: $("job-enabled").checked, days: [0, 1, 2, 3, 4], time: body.time || "02:00" };
-      body.copyIds = [];
       try {
-        await send("/api/jobs", body);
+        await send("/api/clusters", body);
         event.target.reset();
         await refresh();
       } catch { /* shown */ }
     });
 
-    $("base-form").addEventListener("submit", async (event) => {
-      event.preventDefault();
-      const body = Object.fromEntries(new FormData(event.target).entries());
-      body.schedule = { enabled: $("base-enabled").checked, days: [0, 1, 2, 3, 4], time: body.time || "02:00" };
-      body.copyIds = [];
+    async function loadSystem() {
       try {
-        await send("/api/bases", body);
-        event.target.reset();
-        await refresh();
+        const data = await api("/api/system");
+        $("sys-host").value = data.hostname || "";
+        $("sys-tz").value = data.timezone || "";
+        $("sys-ntp").checked = Boolean(data.ntp);
+        $("sys-dns").value = (data.dns || []).join(" ");
+        $("sys-fw").checked = Boolean(data.firewallActive);
+        $("sys-fw-text").textContent = data.firewall || "";
+        $("sys-ip").textContent = data.interfaces || "";
+        $("sys-ssh").checked = data.ssh === "active";
+      } catch (error) {
+        $("form-error").textContent = error.message;
+      }
+    }
+
+    $("system-form").addEventListener("submit", async (event) => {
+      event.preventDefault();
+      try {
+        await send("/api/system", { op: "hostname", value: $("sys-host").value });
+        await send("/api/system", { op: "timezone", value: $("sys-tz").value });
+        await send("/api/system", { op: "ntp", value: $("sys-ntp").checked });
+        await send("/api/system", { op: "locale", value: $("sys-locale").value });
+        await loadSystem();
       } catch { /* shown */ }
     });
+
+    $("net-form").addEventListener("submit", async (event) => {
+      event.preventDefault();
+      try {
+        await send("/api/system", { op: "dns", value: $("sys-dns").value });
+        await send("/api/system", { op: "firewall", value: $("sys-fw").checked });
+        await send("/api/system", { op: "ssh", value: $("sys-ssh").checked });
+        await loadSystem();
+      } catch { /* shown */ }
+    });
+
+    $("port-open").addEventListener("click", async () => {
+      try {
+        await send("/api/system", { op: "firewall-allow", value: $("sys-port").value });
+        await loadSystem();
+      } catch { /* shown */ }
+    });
+
+    async function power(action) {
+      const result = await send("/api/power", { action });
+      $("service-log").textContent = result.detail;
+    }
+    $("act-reboot").addEventListener("click", () => power("reboot"));
+    $("act-off").addEventListener("click", () => power("poweroff"));
+    $("act-update").addEventListener("click", async () => {
+      const result = await send("/api/update", {});
+      $("service-log").textContent = result.detail;
+    });
+
+    async function loadRelease() {
+      try {
+        const data = await api("/api/release");
+        $("rel-title").textContent = data.error || data.title || "";
+        $("rel-when").textContent = data.when || "";
+        $("rel-body").textContent = data.body || "";
+        if (data.url) $("rel-url").href = data.url;
+      } catch (error) {
+        $("rel-title").textContent = error.message;
+      }
+    }
 
     document.body.addEventListener("click", async (event) => {
+      const catalog = event.target.dataset.catalog;
+      if (catalog) {
+        try {
+          await send("/api/" + catalog + "/catalog", { id: event.target.dataset.id });
+          await refresh();
+        } catch { /* shown */ }
+        return;
+      }
+      const take = event.target.dataset.take;
+      if (take) {
+        const source = event.target.dataset.source;
+        const select = document.querySelector(`[data-pick="${source}"]`);
+        if (!select || !select.value) return;
+        try {
+          await send("/api/chosen", { kind: take, sourceId: source, name: select.value });
+          await refresh();
+        } catch { /* shown */ }
+        return;
+      }
+      const add = event.target.dataset.add;
+      if (add) {
+        const target = event.target.dataset.target;
+        const disk = document.querySelector(`[data-disk="${target}"]`);
+        const keep = document.querySelector(`[data-keep="${target}"]`);
+        try {
+          await send("/api/backup-jobs", {
+            kind: add,
+            targetId: target,
+            storageId: disk ? disk.value : "",
+            schedule: { enabled: true, days: [0, 1, 2, 3, 4], time: "02:00", keepDays: Number(keep && keep.value) || 14 }
+          });
+          await refresh();
+        } catch { /* shown */ }
+        return;
+      }
       const drop = event.target.dataset.drop;
       if (drop) {
         const [kind, id] = drop.split(":");
-        await api("/api/" + kind + "?id=" + encodeURIComponent(id), { method: "DELETE" });
+        const extra = event.target.dataset.kind ? "&kind=" + event.target.dataset.kind : "";
+        await api("/api/" + kind + "?id=" + encodeURIComponent(id) + extra, { method: "DELETE" });
         await refresh();
       }
       const run = event.target.dataset.run;
       if (run) {
-        const result = await send("/api/jobs/run", { id: run });
+        const result = await send("/api/backup-jobs/run", { id: run });
         $("vm-log").textContent = (result.log || []).join("\n");
       }
     });
