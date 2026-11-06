@@ -364,8 +364,11 @@ def run_vm(job: dict, host: dict, storage: dict) -> list:
             return log
         turned_off = True
         log.append("машина выключена")
-        folder = MOUNT_ROOT / storage["id"] / "vms" / safe_name(job["vmName"])
-        stamp_dir = folder / datetime.now().strftime("%Y%m%d-%H%M%S")
+        stamp_dir = Path(job["stampDir"]) if job.get("stampDir") else None
+        if stamp_dir is None:
+            folder = MOUNT_ROOT / storage["id"] / "vms" / safe_name(job["vmName"])
+            stamp_dir = folder / datetime.now().strftime("%Y%m%d-%H%M%S")
+            stamp_dir.mkdir(parents=True, exist_ok=True)
         stamp_dir.mkdir(parents=True, exist_ok=True)
         note = stamp_dir / "backup.txt"
         note.write_text(f"{job['vmName']} off, host {host['host']}\n", encoding="utf-8")
@@ -763,6 +766,191 @@ def wait_off(base: str, root: str, session: str, vm_id: str) -> bool:
 def safe_name(value: str) -> str:
     cleaned = "".join(char if char.isalnum() or char in "-_." else "_" for char in value)
     return cleaned or "vm"
+
+
+def deliver(storage: dict, remote_folder: str, stamp: Path) -> str:
+    if os.environ.get("ONEC_PROBE") == "skip":
+        return f"копия {stamp.name} отложена"
+    try:
+        rel = f"{clean_rel(remote_folder)}/{stamp.name}".strip("/")
+        kind = storage.get("kind")
+        if kind in ("cifs", "nfs"):
+            return f"записано в {stamp}"
+        if kind == "ftp":
+            upload_ftp_tree(storage, rel, stamp)
+        elif kind in ("webdav", "mail"):
+            upload_webdav_tree(storage, rel, stamp)
+        elif kind == "yandex":
+            upload_yandex_tree(storage, rel, stamp)
+        elif kind == "google":
+            upload_google_tree(storage, rel, stamp)
+        else:
+            return "копия не отправлена: неизвестный тип"
+        return f"копия в {storage.get('name')} / {rel}"
+    except Exception as error:
+        return f"копия не ушла: {error}"
+
+
+def upload_ftp_tree(item: dict, remote: str, stamp: Path) -> None:
+    import ftplib
+
+    host, port = split_host(item["endpoint"], 21)
+    ftp = ftplib.FTP()
+    ftp.connect(host, port, timeout=30)
+    ftp.login(item.get("login") or "anonymous", item.get("secret") or "anonymous@")
+    root = ftp_dir(item["endpoint"]).rstrip("/")
+    for file in stamp.rglob("*"):
+        if not file.is_file():
+            continue
+        rel = f"{remote}/{file.relative_to(stamp).as_posix()}"
+        ftp_mkdirs(ftp, f"{root}/{rel}".rsplit("/", 1)[0])
+        with file.open("rb") as handle:
+            ftp.storbinary(f"STOR {root}/{rel}", handle)
+    ftp.quit()
+
+
+def ftp_mkdirs(ftp, path: str) -> None:
+    built = ""
+    for part in path.split("/"):
+        if not part:
+            continue
+        built += "/" + part
+        try:
+            ftp.mkd(built)
+        except Exception:
+            continue
+
+
+def upload_webdav_tree(item: dict, remote: str, stamp: Path) -> None:
+    for file in stamp.rglob("*"):
+        if not file.is_file():
+            continue
+        rel = f"{remote}/{file.relative_to(stamp).as_posix()}"
+        webdav_mkcol(item, rel.rsplit("/", 1)[0])
+        data = file.read_bytes()
+        request = urllib.request.Request(join_url(webdav_base(item), rel), data=data, method="PUT")
+        webdav_auth(request, item)
+        with urllib.request.urlopen(request, timeout=120, context=CTX):
+            pass
+
+
+def webdav_mkcol(item: dict, rel: str) -> None:
+    built = []
+    for part in rel.split("/"):
+        if not part:
+            continue
+        built.append(part)
+        request = urllib.request.Request(join_url(webdav_base(item), "/".join(built)), method="MKCOL")
+        webdav_auth(request, item)
+        try:
+            with urllib.request.urlopen(request, timeout=20, context=CTX):
+                pass
+        except urllib.error.HTTPError as error:
+            if error.code not in (301, 405, 409):
+                raise
+
+
+def webdav_auth(request, item: dict) -> None:
+    login = item.get("login", "")
+    secret = item.get("secret", "")
+    if login or secret:
+        request.add_header("Authorization", "Basic " + b64encode(f"{login}:{secret}".encode()).decode())
+
+
+def upload_yandex_tree(item: dict, remote: str, stamp: Path) -> None:
+    token = item.get("secret", "")
+    root = yandex_root(item.get("endpoint", "")).rstrip("/")
+    for file in stamp.rglob("*"):
+        if not file.is_file():
+            continue
+        disk_path = f"{root}/{remote}/{file.relative_to(stamp).as_posix()}"
+        yandex_mkdir(token, disk_path.rsplit("/", 1)[0])
+        href = yandex_href(token, disk_path)
+        request = urllib.request.Request(href, data=file.read_bytes(), method="PUT")
+        with urllib.request.urlopen(request, timeout=120):
+            pass
+
+
+def yandex_mkdir(token: str, path: str) -> None:
+    query = urllib.parse.urlencode({"path": path})
+    request = urllib.request.Request(
+        "https://cloud-api.yandex.net/v1/disk/resources?" + query,
+        method="PUT",
+        headers={"Authorization": f"OAuth {token}"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=20):
+            pass
+    except urllib.error.HTTPError as error:
+        if error.code != 409:
+            raise
+
+
+def yandex_href(token: str, path: str) -> str:
+    query = urllib.parse.urlencode({"path": path, "overwrite": "true"})
+    request = urllib.request.Request(
+        "https://cloud-api.yandex.net/v1/disk/resources/upload?" + query,
+        headers={"Authorization": f"OAuth {token}"},
+    )
+    with urllib.request.urlopen(request, timeout=20) as response:
+        return json.loads(response.read().decode())["href"]
+
+
+def upload_google_tree(item: dict, remote: str, stamp: Path) -> None:
+    token = item.get("secret", "")
+    parent = google_root(item.get("endpoint", ""))
+    for part in [part for part in clean_rel(remote).split("/") if part]:
+        parent = google_folder(token, parent, part)
+    for file in stamp.rglob("*"):
+        if not file.is_file():
+            continue
+        folder = parent
+        for part in file.parent.relative_to(stamp).parts:
+            folder = google_folder(token, folder, part)
+        google_upload(token, folder, file)
+
+
+def google_folder(token: str, parent: str, name: str) -> str:
+    safe = name.replace("'", "")
+    query = urllib.parse.urlencode({
+        "q": f"name='{safe}' and '{parent}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false",
+        "fields": "files(id)",
+    })
+    request = urllib.request.Request(
+        "https://www.googleapis.com/drive/v3/files?" + query,
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    with urllib.request.urlopen(request, timeout=20) as response:
+        found = json.loads(response.read().decode()).get("files") or []
+    if found:
+        return found[0]["id"]
+    body = json.dumps({"name": name, "mimeType": "application/vnd.google-apps.folder", "parents": [parent]}).encode()
+    request = urllib.request.Request(
+        "https://www.googleapis.com/drive/v3/files",
+        data=body,
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(request, timeout=20) as response:
+        return json.loads(response.read().decode())["id"]
+
+
+def google_upload(token: str, parent: str, file: Path) -> None:
+    boundary = "onecboundary"
+    meta = json.dumps({"name": file.name, "parents": [parent]}).encode()
+    body = (
+        f"--{boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n".encode()
+        + meta
+        + f"\r\n--{boundary}\r\nContent-Type: application/octet-stream\r\n\r\n".encode()
+        + file.read_bytes()
+        + f"\r\n--{boundary}--".encode()
+    )
+    request = urllib.request.Request(
+        "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart",
+        data=body,
+        headers={"Authorization": f"Bearer {token}", "Content-Type": f"multipart/related; boundary={boundary}"},
+    )
+    with urllib.request.urlopen(request, timeout=120):
+        pass
 
 
 def schedule_due(schedule: dict, now: datetime, last_slot: str) -> bool:

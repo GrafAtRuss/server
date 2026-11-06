@@ -127,7 +127,7 @@
   <div id="boot" class="login"><p class="muted mono">Открываем консоль…</p></div>
   <form id="login" class="login hidden">
     <div class="card">
-      <p class="eyebrow">1.2.8</p>
+      <p class="eyebrow">1.2.9</p>
       <h1 style="margin-top:12px">Консоль платформы</h1>
       <label class="lbl" for="login-name">Логин</label>
       <input id="login-name" autocomplete="username" style="margin-top:8px" />
@@ -140,7 +140,7 @@
   <div id="app" class="shell hidden">
     <aside>
       <div>
-        <p class="eyebrow" style="color:var(--rail-dim)">1.2.8</p>
+        <p class="eyebrow" style="color:var(--rail-dim)">1.2.9</p>
         <p style="margin:4px 0 0;font-size:18px;font-weight:600">Консоль платформы</p>
       </div>
       <nav class="nav" style="overflow:auto">
@@ -421,16 +421,31 @@
       $("disk-list").innerHTML = disks.map(storageRow).join("") || "<p class='muted'>Пока ничего не подключено.</p>";
       $("cloud-list").innerHTML = (state.storages || []).filter((item) => item.role === "cloud").map(storageRow).join("") || "<p class='muted'>Пока ничего не подключено.</p>";
       const diskOptions = disks.map((item) => `<option value="${item.id}">${item.name}</option>`).join("");
+      const days = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"];
+      const clouds = (state.storages || []).filter((item) => item.role === "cloud");
       const jobsOf = (kind, id) => (state.backupJobs || []).filter((job) => job.kind === kind && job.targetId === id);
-      const jobHtml = (job) => `<p>${job.schedule && job.schedule.enabled ? job.schedule.time : "вручную"} · хранить ${job.schedule ? job.schedule.keepDays : 14} дн. <button class="ghost" type="button" data-run="${job.id}">Запустить</button> <button class="ghost" type="button" data-drop="backup-jobs:${job.id}">Удалить</button></p>`;
+      const jobHtml = (job) => {
+        const sched = job.schedule || {};
+        const when = sched.enabled ? days.filter((_, index) => (sched.days || []).includes(index)).join(" ") + " " + (sched.time || "") : "вручную";
+        const place = job.folder ? "папка " + esc(job.folder) : "папка по умолчанию";
+        const cloud = (job.copyIds || []).length ? " · облако " + esc(job.cloudFolder || job.folder || "/") : "";
+        return `<p>${when} · ${place}${cloud} · хранить ${sched.keepDays ?? 14} дн. <button class="ghost" type="button" data-run="${job.id}">Запустить</button> <button class="ghost" type="button" data-drop="backup-jobs:${job.id}">Удалить</button></p>`;
+      };
+      const jobForm = (id, kind) => {
+        const dayButtons = days.map((label, index) => `<button class="ghost" type="button" data-day="${index}" data-day-for="${id}" data-on="${index < 5 ? "1" : "0"}" style="${index < 5 ? "background:var(--pine);color:#fff" : ""}">${label}</button>`).join("");
+        const cloud = clouds.length
+          ? `<div>${clouds.map((item) => `<label><input type="checkbox" data-cloud-for="${id}" value="${esc(item.id)}"> ${esc(item.name)}</label>`).join(" ")}</div><input data-cloud-folder="${id}" placeholder="Папка в облаке" />`
+          : `<p class="muted">Облако не подключено — копия только на диск.</p>`;
+        return `<div class="stack"><select data-disk="${id}">${diskOptions}</select><input data-folder="${id}" placeholder="Папка в хранилище" /><label><input type="checkbox" data-sched="${id}" checked> По расписанию</label><div>${dayButtons}</div><input data-time="${id}" type="time" value="02:00" /><input data-keep="${id}" type="number" min="0" value="14" />${cloud}<button class="primary" type="button" data-add="${kind}" data-target="${id}">Добавить бекап</button></div>`;
+      };
       $("host-list").innerHTML = (state.hosts || []).map((item) => {
         const options = (item.catalog || []).map((name) => `<option>${name}</option>`).join("");
-        const chosen = (state.chosenVms || []).filter((vm) => vm.sourceId === item.id).map((vm) => `<div style="margin-top:12px"><b>${vm.name}</b> <button class="ghost" type="button" data-drop="chosen:${vm.id}" data-kind="vm">Убрать</button>${jobsOf("vm", vm.id).map(jobHtml).join("")}<div class="stack"><select data-disk="${vm.id}">${diskOptions}</select><input data-keep="${vm.id}" type="number" value="14" /><button class="primary" type="button" data-add="vm" data-target="${vm.id}">Добавить бекап</button></div></div>`).join("");
+        const chosen = (state.chosenVms || []).filter((vm) => vm.sourceId === item.id).map((vm) => `<div style="margin-top:12px"><b>${esc(vm.name)}</b> <button class="ghost" type="button" data-drop="chosen:${vm.id}" data-kind="vm">Убрать</button>${jobsOf("vm", vm.id).map(jobHtml).join("")}${jobForm(vm.id, "vm")}</div>`).join("");
         return `${row(item, "hosts")}<div class="stack"><button class="ghost" type="button" data-catalog="hosts" data-id="${item.id}">Обновить список</button><select data-pick="${item.id}">${options}</select><button class="dark" type="button" data-take="vm" data-source="${item.id}">Взять в работу</button></div>${chosen}`;
       }).join("") || "<p class='muted'>Гипервизоры не подключены.</p>";
       $("cluster-list").innerHTML = (state.clusters || []).map((item) => {
         const options = (item.catalog || []).map((name) => `<option>${name}</option>`).join("");
-        const chosen = (state.chosenBases || []).filter((base) => base.sourceId === item.id).map((base) => `<div style="margin-top:12px"><b>${base.name}</b> <button class="ghost" type="button" data-drop="chosen:${base.id}" data-kind="base">Убрать</button>${jobsOf("base", base.id).map(jobHtml).join("")}<div class="stack"><select data-disk="${base.id}">${diskOptions}</select><input data-keep="${base.id}" type="number" value="14" /><button class="primary" type="button" data-add="base" data-target="${base.id}">Добавить бекап</button></div></div>`).join("");
+        const chosen = (state.chosenBases || []).filter((base) => base.sourceId === item.id).map((base) => `<div style="margin-top:12px"><b>${esc(base.name)}</b> <button class="ghost" type="button" data-drop="chosen:${base.id}" data-kind="base">Убрать</button>${jobsOf("base", base.id).map(jobHtml).join("")}${jobForm(base.id, "base")}</div>`).join("");
         return `${row(item, "clusters")}<p class="mono muted">${item.host}:${item.port}</p><div class="stack"><button class="ghost" type="button" data-catalog="clusters" data-id="${item.id}">Обновить список</button><select data-pick="${item.id}">${options}</select><button class="dark" type="button" data-take="base" data-source="${item.id}">Взять в работу</button></div>${chosen}`;
       }).join("") || "<p class='muted'>Серверы баз не подключены.</p>";
       $("users").innerHTML = state.users.map((user) => `<li style="display:flex;justify-content:space-between;gap:12px;padding:12px 0;border-bottom:1px solid var(--line)"><span>${user.name}<br><span class="mono muted">${user.login}</span></span>${user.login === state.me.login ? "<span class='muted'>это вы</span>" : `<button class="ghost" data-remove="${user.login}" type="button">Удалить</button>`}</li>`).join("");
@@ -882,6 +897,13 @@
         $("browse").classList.add("hidden");
         return;
       }
+      if (event.target.dataset.day) {
+        const on = event.target.dataset.on !== "1";
+        event.target.dataset.on = on ? "1" : "0";
+        event.target.style.background = on ? "var(--pine)" : "";
+        event.target.style.color = on ? "#fff" : "";
+        return;
+      }
       const catalog = event.target.dataset.catalog;
       if (catalog) {
         try {
@@ -906,12 +928,21 @@
         const target = event.target.dataset.target;
         const disk = document.querySelector(`[data-disk="${target}"]`);
         const keep = document.querySelector(`[data-keep="${target}"]`);
+        const folder = document.querySelector(`[data-folder="${target}"]`);
+        const cloudFolder = document.querySelector(`[data-cloud-folder="${target}"]`);
+        const enabled = document.querySelector(`[data-sched="${target}"]`);
+        const time = document.querySelector(`[data-time="${target}"]`);
+        const pickedDays = [...document.querySelectorAll(`[data-day-for="${target}"]`)].filter((item) => item.dataset.on === "1").map((item) => Number(item.dataset.day));
+        const copyIds = [...document.querySelectorAll(`[data-cloud-for="${target}"]`)].filter((item) => item.checked).map((item) => item.value);
         try {
           await send("/api/backup-jobs", {
             kind: add,
             targetId: target,
             storageId: disk ? disk.value : "",
-            schedule: { enabled: true, days: [0, 1, 2, 3, 4], time: "02:00", keepDays: Number(keep && keep.value) || 14 }
+            folder: folder ? folder.value : "",
+            cloudFolder: cloudFolder ? cloudFolder.value : "",
+            copyIds,
+            schedule: { enabled: Boolean(enabled && enabled.checked), days: pickedDays, time: time && time.value ? time.value : "02:00", keepDays: Number(keep && keep.value) || 14 }
           });
           await refresh();
         } catch { /* shown */ }

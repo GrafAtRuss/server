@@ -14,22 +14,24 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from ops import list_storage, probe, public_copy, run_vm, schedule_due
 from hostadmin import (
     apply_system,
+    auth_hint,
     backup_dir,
     cluster_catalog,
     github_changelog,
     github_release,
     new_stamp,
+    open_backup,
     prune,
     read_system,
     schedule_power,
     schedule_update,
     vm_catalog,
 )
+from ops import deliver, list_storage, probe, public_copy, run_vm, schedule_due
 
-PRODUCT_VERSION = "1.2.8"
+PRODUCT_VERSION = "1.2.9"
 
 STATE_DIR = Path(os.environ.get("ONEC_STATE_DIR", "/var/lib/onec-console"))
 CACHE_DIR = Path(os.environ.get("ONEC_CACHE_DIR", "/var/cache/onec-platform"))
@@ -895,8 +897,7 @@ class Handler(BaseHTTPRequestHandler):
         if kind not in ("base", "vm") or not payload.get("targetId") or not payload.get("storageId"):
             self._send(400, {"error": "Нужны объект и диск."})
             return
-        schedule = payload.get("schedule") or {"enabled": False, "days": [0, 1, 2, 3, 4], "time": "02:00", "keepDays": 14}
-        schedule.setdefault("keepDays", 14)
+        schedule = read_schedule(payload.get("schedule"))
         with LOCK:
             state = load_state()
             state["backupJobs"].append(
@@ -905,7 +906,9 @@ class Handler(BaseHTTPRequestHandler):
                     "kind": kind,
                     "targetId": payload.get("targetId"),
                     "storageId": payload.get("storageId"),
+                    "folder": clean_folder(payload.get("folder")),
                     "copyIds": payload.get("copyIds") or [],
+                    "cloudFolder": clean_folder(payload.get("cloudFolder")),
                     "schedule": schedule,
                     "lastSlot": "",
                     "lastLog": [],
@@ -932,46 +935,86 @@ class Handler(BaseHTTPRequestHandler):
         self._send(200, {"log": log})
 
 
+def read_schedule(value) -> dict:
+    raw = value or {}
+    days = []
+    for day in raw.get("days") or []:
+        try:
+            number = int(day)
+        except (TypeError, ValueError):
+            continue
+        if 0 <= number <= 6:
+            days.append(number)
+    time_value = str(raw.get("time") or "02:00")
+    if len(time_value) != 5 or time_value[2] != ":":
+        time_value = "02:00"
+    try:
+        keep = int(raw.get("keepDays") if raw.get("keepDays") is not None else 14)
+    except (TypeError, ValueError):
+        keep = 14
+    return {"enabled": bool(raw.get("enabled")), "days": days, "time": time_value, "keepDays": max(keep, 0)}
+
+
+def clean_folder(value) -> str:
+    from ops import clean_rel
+
+    try:
+        return clean_rel(value or "")
+    except RuntimeError:
+        return ""
+
+
 def perform_backup(state: dict, job: dict) -> list:
     storage = next((item for item in state["storages"] if item["id"] == job["storageId"]), None)
     if not storage:
         return ["диск бекапа не найден"]
     keep = int((job.get("schedule") or {}).get("keepDays") or 0)
-    if job["kind"] == "vm":
-        chosen = next((item for item in state["chosenVms"] if item["id"] == job["targetId"]), None)
-        host = next((item for item in state["hosts"] if chosen and item["id"] == chosen["sourceId"]), None)
-        if not chosen or not host:
-            return ["машина или гипервизор не найдены"]
-        vm_job = {**job, "vmName": chosen["name"]}
-        log = run_vm(vm_job, host, storage)
-        removed = prune(backup_dir(storage["id"], "vms", chosen["name"]), keep)
-        if removed:
-            log.append("удалено старше срока: " + ", ".join(removed))
-        return log
-    chosen = next((item for item in state["chosenBases"] if item["id"] == job["targetId"]), None)
-    cluster = next((item for item in state["clusters"] if chosen and item["id"] == chosen["sourceId"]), None)
-    if not chosen or not cluster:
-        return ["база или кластер не найдены"]
-    folder = backup_dir(storage["id"], "bases", chosen["name"])
-    stamp = new_stamp(folder)
-    target = f"{cluster['host']}\\{chosen['name']}"
-    installed = state.get("installed") or {}
-    binary = installed.get("binary")
-    if os.environ.get("ONEC_PROBE") == "skip" or not binary:
-        (stamp / "config.cf").write_text(f"dump {target}\n", encoding="utf-8")
-        log = [f"бекап {target} → {stamp}"]
-    else:
-        result = subprocess.run(
-            [
-                binary, "DESIGNER", "/S", target, "/N", cluster.get("login", ""), "/P", cluster.get("secret", ""),
-                "/DisableStartupDialogs", "/DumpCfg", str(stamp / "config.cf"),
-            ],
-            text=True, capture_output=True, check=False, timeout=3600,
-        )
-        log = [f"бекап {target} → {stamp}", (result.stdout or result.stderr or "").strip()]
-        if result.returncode != 0:
-            log.append("Конфигуратор завершился с ошибкой")
-    removed = prune(folder, keep)
+    folder = job.get("folder") or ""
+    try:
+        if job["kind"] == "vm":
+            chosen = next((item for item in state["chosenVms"] if item["id"] == job["targetId"]), None)
+            host = next((item for item in state["hosts"] if chosen and item["id"] == chosen["sourceId"]), None)
+            if not chosen or not host:
+                return ["машина или гипервизор не найдены"]
+            stamp, parent = open_backup(storage, folder, "vms", chosen["name"])
+            vm_job = {**job, "vmName": chosen["name"], "stampDir": str(stamp)}
+            log = run_vm(vm_job, host, storage)
+        else:
+            chosen = next((item for item in state["chosenBases"] if item["id"] == job["targetId"]), None)
+            cluster = next((item for item in state["clusters"] if chosen and item["id"] == chosen["sourceId"]), None)
+            if not chosen or not cluster:
+                return ["база или кластер не найдены"]
+            stamp, parent = open_backup(storage, folder, "bases", chosen["name"])
+            target = f"{cluster['host']}\\{chosen['name']}"
+            installed = state.get("installed") or {}
+            binary = installed.get("binary")
+            if os.environ.get("ONEC_PROBE") == "skip" or not binary:
+                (stamp / "config.cf").write_text(f"dump {target}\n", encoding="utf-8")
+                log = [f"бекап {target} → {stamp}"]
+            else:
+                result = subprocess.run(
+                    [
+                        binary, "DESIGNER", "/S", target, "/N", cluster.get("login", ""), "/P", cluster.get("secret", ""),
+                        "/DisableStartupDialogs", "/DumpCfg", str(stamp / "config.cf"),
+                    ],
+                    text=True, capture_output=True, check=False, timeout=3600,
+                )
+                log = [f"бекап {target} → {stamp}", (result.stdout or result.stderr or "").strip()]
+                if result.returncode != 0:
+                    log.append("Конфигуратор завершился с ошибкой")
+                    return log
+    except Exception as error:
+        return [str(error)]
+    if stamp.is_dir() and any(stamp.iterdir()):
+        if storage.get("kind") not in ("cifs", "nfs"):
+            log.append(deliver(storage, folder, stamp))
+        else:
+            log.append(f"папка {stamp}")
+        for cloud_id in job.get("copyIds") or []:
+            cloud = next((item for item in state["storages"] if item["id"] == cloud_id and item.get("role") == "cloud"), None)
+            if cloud:
+                log.append(deliver(cloud, job.get("cloudFolder") or folder, stamp))
+    removed = prune(parent, keep)
     if removed:
         log.append("удалено старше срока: " + ", ".join(removed))
     return log
@@ -1003,6 +1046,12 @@ def tick() -> None:
     if changed:
         with LOCK:
             fresh = load_state()
+            slots = {item["id"]: item.get("lastSlot", "") for item in state.get("backupJobs", [])}
+            logs = {item["id"]: item.get("lastLog", []) for item in state.get("backupJobs", [])}
+            for item in fresh.get("backupJobs", []):
+                if item["id"] in slots:
+                    item["lastSlot"] = slots[item["id"]]
+                    item["lastLog"] = logs[item["id"]]
             fresh["jobs"] = state["jobs"]
             save_state(fresh)
 

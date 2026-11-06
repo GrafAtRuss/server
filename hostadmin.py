@@ -11,7 +11,7 @@ import urllib.request
 from datetime import datetime
 from pathlib import Path
 
-from ops import MOUNT_ROOT, list_vm_names, safe_name
+from ops import MOUNT_ROOT, clean_rel, list_vm_names, mount_disk, safe_name
 
 REPO = "https://github.com/GrafAtRuss/server.git"
 SRC = Path("/opt/onec-console-src")
@@ -575,6 +575,22 @@ def backup_dir(storage_id: str, kind: str, name: str) -> Path:
     folder = MOUNT_ROOT / storage_id / kind / safe_name(name)
     folder.mkdir(parents=True, exist_ok=True)
     return folder
+
+
+def open_backup(storage: dict, folder: str, kind: str, name: str) -> tuple[Path, Path]:
+    rel = clean_rel(folder) or f"{kind}/{safe_name(name)}"
+    if storage.get("kind") in ("cifs", "nfs"):
+        ok, detail = mount_disk(storage)
+        if not ok:
+            raise RuntimeError(detail)
+        root = (MOUNT_ROOT / storage["id"]).resolve()
+    else:
+        root = (Path(os.environ.get("ONEC_CACHE_DIR", "/var/cache/onec-platform")) / "stage" / storage["id"]).resolve()
+    parent = (root / rel).resolve()
+    if os.path.commonpath([str(root), str(parent)]) != str(root):
+        raise RuntimeError("папка вне хранилища")
+    parent.mkdir(parents=True, exist_ok=True)
+    return new_stamp(parent), parent
 
 
 def new_stamp(folder: Path) -> Path:
