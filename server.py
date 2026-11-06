@@ -14,7 +14,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from ops import probe, public_copy, run_vm, schedule_due
+from ops import list_storage, probe, public_copy, run_vm, schedule_due
 from hostadmin import (
     apply_system,
     backup_dir,
@@ -29,7 +29,7 @@ from hostadmin import (
     vm_catalog,
 )
 
-PRODUCT_VERSION = "1.2.6"
+PRODUCT_VERSION = "1.2.7"
 
 STATE_DIR = Path(os.environ.get("ONEC_STATE_DIR", "/var/lib/onec-console"))
 CACHE_DIR = Path(os.environ.get("ONEC_CACHE_DIR", "/var/cache/onec-platform"))
@@ -292,6 +292,22 @@ class Handler(BaseHTTPRequestHandler):
                     "backupJobs": state["backupJobs"],
                 },
             )
+            return
+        if path == "/api/storages/browse":
+            user = self._guard(state)
+            if not user:
+                return
+            query = parse_qs(urlparse(self.path).query)
+            item_id = (query.get("id") or [""])[0]
+            rel = (query.get("path") or [""])[0]
+            item = next((row for row in state["storages"] if row["id"] == item_id), None)
+            if not item:
+                self._send(404, {"error": "Хранилище не найдено."})
+                return
+            try:
+                self._send(200, list_storage(item, rel))
+            except Exception as error:
+                self._send(400, {"error": str(error)})
             return
         if path in ("/api/system", "/api/release", "/api/changelog"):
             user = self._guard(state)

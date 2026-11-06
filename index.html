@@ -127,7 +127,7 @@
   <div id="boot" class="login"><p class="muted mono">Открываем консоль…</p></div>
   <form id="login" class="login hidden">
     <div class="card">
-      <p class="eyebrow">1.2.6</p>
+      <p class="eyebrow">1.2.7</p>
       <h1 style="margin-top:12px">Консоль платформы</h1>
       <label class="lbl" for="login-name">Логин</label>
       <input id="login-name" autocomplete="username" style="margin-top:8px" />
@@ -140,7 +140,7 @@
   <div id="app" class="shell hidden">
     <aside>
       <div>
-        <p class="eyebrow" style="color:var(--rail-dim)">1.2.6</p>
+        <p class="eyebrow" style="color:var(--rail-dim)">1.2.7</p>
         <p style="margin:4px 0 0;font-size:18px;font-weight:600">Консоль платформы</p>
       </div>
       <nav class="nav" style="overflow:auto">
@@ -222,6 +222,17 @@
           </div>
           <ul id="cloud-list" style="list-style:none;padding:0"></ul>
         </form>
+        <div id="browse" class="panel hidden" style="grid-column:1/-1">
+          <div style="display:flex;justify-content:space-between;gap:12px;align-items:center">
+            <strong id="browse-title">Содержимое</strong>
+            <span>
+              <button id="browse-up" class="ghost" type="button">Вверх</button>
+              <button id="browse-close" class="ghost" type="button">Закрыть</button>
+            </span>
+          </div>
+          <p id="browse-path" class="mono muted"></p>
+          <div id="browse-rows"></div>
+        </div>
       </section>
       <section id="tab-vms" class="hidden grid">
         <form id="host-form" class="panel">
@@ -405,9 +416,10 @@
       }
       $("log").textContent = (state.log || []).join("\n") || "Ожидание запуска. Порядок: common → server → client → thin-client.";
       const disks = (state.storages || []).filter((item) => item.role === "disk");
-      const row = (item, action) => `<div style="display:flex;justify-content:space-between;gap:12px;padding:10px 0;border-bottom:1px solid var(--line)"><span>${item.name}<br><span class="mono muted">${item.detail || item.host || item.endpoint || ""}</span></span><button class="ghost" type="button" data-drop="${action}:${item.id}">Удалить</button></div>`;
-      $("disk-list").innerHTML = disks.map((item) => row(item, "storages")).join("") || "<p class='muted'>Пока ничего не подключено.</p>";
-      $("cloud-list").innerHTML = (state.storages || []).filter((item) => item.role === "cloud").map((item) => row(item, "storages")).join("") || "<p class='muted'>Пока ничего не подключено.</p>";
+      const row = (item, action) => `<div style="display:flex;justify-content:space-between;gap:12px;padding:10px 0;border-bottom:1px solid var(--line)"><span>${esc(item.name)}<br><span class="mono muted">${esc(item.detail || item.host || item.endpoint || "")}</span></span><button class="ghost" type="button" data-drop="${action}:${esc(item.id)}">Удалить</button></div>`;
+      const storageRow = (item) => `<div style="display:flex;justify-content:space-between;gap:12px;padding:10px 0;border-bottom:1px solid var(--line)"><span>${esc(item.name)}<br><span class="mono muted">${esc(item.detail || item.endpoint || "")}</span></span><span><button class="ghost" type="button" data-browse="${esc(item.id)}">Содержимое</button> <button class="ghost" type="button" data-drop="storages:${esc(item.id)}">Удалить</button></span></div>`;
+      $("disk-list").innerHTML = disks.map(storageRow).join("") || "<p class='muted'>Пока ничего не подключено.</p>";
+      $("cloud-list").innerHTML = (state.storages || []).filter((item) => item.role === "cloud").map(storageRow).join("") || "<p class='muted'>Пока ничего не подключено.</p>";
       const diskOptions = disks.map((item) => `<option value="${item.id}">${item.name}</option>`).join("");
       const jobsOf = (kind, id) => (state.backupJobs || []).filter((job) => job.kind === kind && job.targetId === id);
       const jobHtml = (job) => `<p>${job.schedule && job.schedule.enabled ? job.schedule.time : "вручную"} · хранить ${job.schedule ? job.schedule.keepDays : 14} дн. <button class="ghost" type="button" data-run="${job.id}">Запустить</button> <button class="ghost" type="button" data-drop="backup-jobs:${job.id}">Удалить</button></p>`;
@@ -460,7 +472,7 @@
         const leads = {
           platform: "Сервер, толстый и тонкий клиент ставятся одним запуском.",
           bases: "Сервер баз запоминается. Базу выбирают из списка. Бекапов может быть несколько.",
-          storages: "Диски хранят бекапы. Облака получают дополнительную копию.",
+          storages: "Диски хранят бекапы. У каждого подключения можно открыть содержимое.",
           vms: "Гипервизор запоминается. Машину выбирают из списка.",
           system: "Имя хоста, пояс, адрес интерфейса, шлюз, DNS и правила фаервола.",
           service: "Перезагрузка, выключение и обновление с GitHub.",
@@ -816,7 +828,60 @@
       }
     }
 
+    let browse = { id: "", stack: [{ path: "", name: "/" }] };
+
+    function formatSize(size) {
+      if (size === null || size === undefined || size === "") return "";
+      const value = Number(size);
+      if (!Number.isFinite(value)) return "";
+      if (value < 1024) return value + " Б";
+      if (value < 1048576) return (value / 1024).toFixed(1) + " КБ";
+      if (value < 1073741824) return (value / 1048576).toFixed(1) + " МБ";
+      return (value / 1073741824).toFixed(1) + " ГБ";
+    }
+
+    async function loadBrowse() {
+      $("browse").classList.remove("hidden");
+      $("browse-rows").textContent = "Читаем…";
+      const here = browse.stack[browse.stack.length - 1];
+      try {
+        const data = await api("/api/storages/browse?id=" + encodeURIComponent(browse.id) + "&path=" + encodeURIComponent(here.path));
+        $("browse-title").textContent = "Содержимое · " + (data.name || "");
+        $("browse-path").textContent = browse.stack.map((item) => item.name).join(" / ");
+        const rows = (data.entries || []).map((entry) => {
+          const meta = entry.kind === "dir" ? "каталог" : formatSize(entry.size);
+          const name = entry.kind === "dir"
+            ? `<button class="ghost" type="button" data-enter="${esc(entry.path)}" data-label="${esc(entry.name)}">${esc(entry.name)}</button>`
+            : esc(entry.name);
+          return `<div style="display:flex;justify-content:space-between;gap:12px;padding:8px 0;border-bottom:1px solid var(--line)"><span>${name}</span><span class="muted">${meta} ${esc(entry.modified || "")}</span></div>`;
+        }).join("");
+        $("browse-rows").innerHTML = rows || "<p class='muted'>Каталог пуст.</p>";
+      } catch (error) {
+        $("browse-rows").textContent = error.message;
+      }
+    }
+
     document.body.addEventListener("click", async (event) => {
+      const opened = event.target.dataset.browse;
+      if (opened) {
+        browse = { id: opened, stack: [{ path: "", name: "/" }] };
+        await loadBrowse();
+        return;
+      }
+      if (event.target.dataset.enter) {
+        browse.stack.push({ path: event.target.dataset.enter, name: event.target.dataset.label || event.target.dataset.enter });
+        await loadBrowse();
+        return;
+      }
+      if (event.target.id === "browse-up") {
+        if (browse.stack.length > 1) browse.stack.pop();
+        await loadBrowse();
+        return;
+      }
+      if (event.target.id === "browse-close") {
+        $("browse").classList.add("hidden");
+        return;
+      }
       const catalog = event.target.dataset.catalog;
       if (catalog) {
         try {

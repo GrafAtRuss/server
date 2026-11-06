@@ -99,6 +99,250 @@ def public_copy(items: list) -> list:
     return [{key: value for key, value in item.items() if key not in hidden} for item in items]
 
 
+def clean_rel(path: str) -> str:
+    parts = []
+    for part in str(path or "").replace("\\", "/").split("/"):
+        if part in ("", "."):
+            continue
+        if part == "..":
+            raise RuntimeError("путь вне хранилища")
+        parts.append(part)
+    return "/".join(parts)
+
+
+def list_storage(item: dict, path: str) -> dict:
+    rel = clean_rel(path)
+    if os.environ.get("ONEC_PROBE") == "skip":
+        child = f"{rel}/backup" if rel else "backup"
+        return {"name": item.get("name", ""), "path": rel, "entries": [
+            {"name": "backup", "kind": "dir", "size": None, "modified": "", "path": child},
+        ]}
+    kind = item.get("kind")
+    if kind in ("cifs", "nfs"):
+        listing = list_mounted(item, rel)
+    elif kind == "ftp":
+        listing = list_ftp(item, rel)
+    elif kind in ("webdav", "mail"):
+        listing = list_webdav(item, rel)
+    elif kind == "yandex":
+        listing = list_yandex(item, rel)
+    elif kind == "google":
+        listing = list_google(item, rel)
+    else:
+        raise RuntimeError("неизвестный тип хранилища")
+    listing["name"] = item.get("name", "")
+    listing["path"] = rel
+    listing["entries"] = sorted(listing["entries"], key=lambda row: (row["kind"] != "dir", row["name"].lower()))[:500]
+    return listing
+
+
+def list_mounted(item: dict, rel: str) -> dict:
+    ok, detail = mount_disk(item)
+    if not ok:
+        raise RuntimeError(detail)
+    root = (MOUNT_ROOT / item["id"]).resolve()
+    return {"entries": list_tree(root, rel)}
+
+
+def list_tree(root: Path, rel: str) -> list:
+    target = (root / rel).resolve() if rel else root
+    if os.path.commonpath([str(root), str(target)]) != str(root):
+        raise RuntimeError("путь вне хранилища")
+    if not target.is_dir():
+        raise RuntimeError("это не каталог")
+    entries = []
+    for child in target.iterdir():
+        try:
+            resolved = child.resolve()
+            if os.path.commonpath([str(root), str(resolved)]) != str(root):
+                continue
+            stat = child.stat()
+            is_dir = child.is_dir()
+        except OSError:
+            continue
+        entries.append({
+            "name": child.name,
+            "kind": "dir" if is_dir else "file",
+            "size": None if is_dir else stat.st_size,
+            "modified": datetime.fromtimestamp(stat.st_mtime).isoformat(timespec="minutes"),
+            "path": str(resolved.relative_to(root)) if is_dir else "",
+        })
+    return entries
+
+
+def list_ftp(item: dict, rel: str) -> dict:
+    import ftplib
+
+    host, port = split_host(item["endpoint"], 21)
+    root = ftp_dir(item["endpoint"])
+    target = root if not rel else root.rstrip("/") + "/" + rel
+    ftp = ftplib.FTP()
+    ftp.connect(host, port, timeout=20)
+    ftp.login(item.get("login") or "anonymous", item.get("secret") or "anonymous@")
+    ftp.cwd(target)
+    entries = []
+    try:
+        for name, facts in ftp.mlsd():
+            if name in (".", ".."):
+                continue
+            is_dir = facts.get("type") == "dir"
+            size = facts.get("size")
+            entries.append(entry(name, is_dir, size, facts.get("modify", ""), rel))
+    except Exception:
+        for name in ftp.nlst():
+            base = name.rstrip("/").split("/")[-1]
+            if base in (".", "..", ""):
+                continue
+            entries.append(entry(base, False, None, "", rel))
+    ftp.quit()
+    return {"entries": entries}
+
+
+def ftp_dir(endpoint: str) -> str:
+    raw = str(endpoint).replace("ftp://", "")
+    tail = raw.split("/", 1)[1].strip("/") if "/" in raw else ""
+    return "/" + tail if tail else "/"
+
+
+def list_webdav(item: dict, rel: str) -> dict:
+    base = webdav_base(item)
+    url = join_url(base, rel)
+    body = (
+        '<?xml version="1.0" encoding="utf-8"?>'
+        '<d:propfind xmlns:d="DAV:"><d:prop>'
+        "<d:displayname/><d:getcontentlength/><d:getlastmodified/><d:resourcetype/>"
+        "</d:prop></d:propfind>"
+    ).encode()
+    request = urllib.request.Request(url, data=body, method="PROPFIND", headers={"Depth": "1", "Content-Type": "application/xml"})
+    login = item.get("login", "")
+    secret = item.get("secret", "")
+    if login or secret:
+        request.add_header("Authorization", "Basic " + b64encode(f"{login}:{secret}".encode()).decode())
+    with urllib.request.urlopen(request, timeout=25, context=CTX) as response:
+        payload = response.read()
+    return {"entries": parse_webdav(payload, rel)}
+
+
+def webdav_base(item: dict) -> str:
+    if item.get("kind") == "mail":
+        extra = str(item.get("endpoint", "")).strip("/")
+        base = "https://webdav.cloud.mail.ru/"
+        return base + extra + "/" if extra and not extra.startswith("http") else base
+    return str(item.get("endpoint", ""))
+
+
+def join_url(base: str, rel: str) -> str:
+    root = base if base.endswith("/") else base + "/"
+    if not rel:
+        return root
+    return root + "/".join(urllib.parse.quote(part) for part in rel.split("/"))
+
+
+def parse_webdav(payload: bytes, rel: str) -> list:
+    import xml.etree.ElementTree as ET
+
+    tree = ET.fromstring(payload)
+    entries = []
+    responses = [node for node in tree.iter() if node.tag.split("}")[-1] == "response"]
+    for index, node in enumerate(responses):
+        if index == 0:
+            continue
+        name = text_of(node, "displayname")
+        href = text_of(node, "href")
+        if not name and href:
+            name = urllib.parse.unquote(href.rstrip("/").split("/")[-1])
+        if not name or name in (".", ".."):
+            continue
+        is_dir = any(child.tag.split("}")[-1] == "collection" for child in node.iter())
+        entries.append(entry(name, is_dir, text_of(node, "getcontentlength"), text_of(node, "getlastmodified"), rel))
+    return entries
+
+
+def text_of(node, name: str) -> str:
+    for child in node.iter():
+        if child.tag.split("}")[-1] == name and child.text:
+            return child.text.strip()
+    return ""
+
+
+def list_yandex(item: dict, rel: str) -> dict:
+    disk = yandex_root(item.get("endpoint", ""))
+    if rel:
+        disk = disk.rstrip("/") + "/" + rel
+    query = urllib.parse.urlencode({"path": disk, "limit": 200})
+    request = urllib.request.Request(
+        "https://cloud-api.yandex.net/v1/disk/resources?" + query,
+        headers={"Authorization": f"OAuth {item.get('secret', '')}"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=25) as response:
+            data = json.loads(response.read().decode())
+    except urllib.error.HTTPError as error:
+        detail = error.read().decode("utf-8", "replace")[:240]
+        raise RuntimeError(f"Яндекс Диск {error.code}: {detail}") from error
+    entries = []
+    for row in (data.get("_embedded") or {}).get("items") or []:
+        is_dir = row.get("type") == "dir"
+        entries.append(entry(row.get("name") or "", is_dir, row.get("size"), row.get("modified", ""), rel))
+    return {"entries": [row for row in entries if row["name"]]}
+
+
+def yandex_root(endpoint: str) -> str:
+    value = str(endpoint or "").strip()
+    if value.startswith("disk:"):
+        return value
+    return "disk:/" + value.strip("/")
+
+
+def list_google(item: dict, rel: str) -> dict:
+    parent = rel or google_root(item.get("endpoint", ""))
+    query = urllib.parse.urlencode({
+        "q": f"'{parent}' in parents and trashed=false",
+        "fields": "files(id,name,mimeType,size,modifiedTime)",
+        "pageSize": 200,
+        "orderBy": "folder,name",
+    })
+    request = urllib.request.Request(
+        "https://www.googleapis.com/drive/v3/files?" + query,
+        headers={"Authorization": f"Bearer {item.get('secret', '')}"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=25) as response:
+            data = json.loads(response.read().decode())
+    except urllib.error.HTTPError as error:
+        detail = error.read().decode("utf-8", "replace")[:240]
+        raise RuntimeError(f"Google Drive {error.code}: {detail}") from error
+    entries = []
+    for row in data.get("files") or []:
+        is_dir = row.get("mimeType") == "application/vnd.google-apps.folder"
+        entries.append({
+            "name": row.get("name") or "",
+            "kind": "dir" if is_dir else "file",
+            "size": None if is_dir else int(row.get("size") or 0),
+            "modified": row.get("modifiedTime") or "",
+            "path": (row.get("id") or "") if is_dir else "",
+        })
+    return {"entries": [row for row in entries if row["name"]]}
+
+
+def google_root(endpoint: str) -> str:
+    value = str(endpoint or "").strip()
+    if not value or value in ("/", "root"):
+        return "root"
+    return value
+
+
+def entry(name: str, is_dir: bool, size, modified: str, rel: str) -> dict:
+    next_path = f"{rel}/{name}".strip("/") if is_dir else ""
+    number = None
+    if not is_dir and size not in (None, ""):
+        try:
+            number = int(size)
+        except (TypeError, ValueError):
+            number = None
+    return {"name": name, "kind": "dir" if is_dir else "file", "size": number, "modified": modified or "", "path": next_path}
+
+
 def run_vm(job: dict, host: dict, storage: dict) -> list:
     if os.environ.get("ONEC_VM") == "skip":
         return [
