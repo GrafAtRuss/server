@@ -6,6 +6,7 @@ import ssl
 import subprocess
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from base64 import b64encode
 from datetime import datetime
@@ -106,7 +107,7 @@ def run_vm(job: dict, host: dict, storage: dict) -> list:
         ]
     log = []
     turned_off = False
-    base = host["host"] if host["host"].startswith("http") else "https://" + host["host"]
+    base = api_base(host["host"])
     try:
         session, root = vsphere_login(base, host["login"], host["secret"])
         vm_id = find_vm(base, root, session, job["vmName"])
@@ -172,29 +173,50 @@ def shutil_which(name: str):
     return which(name)
 
 
-def list_vm_names(host: dict) -> list:
-    base = host["host"] if str(host["host"]).startswith("http") else "https://" + host["host"]
-    session, root = vsphere_login(base, host["login"], host["secret"])
-    payload = api(base, root, session, "/vcenter/vm")
-    rows = payload.get("value", payload) if isinstance(payload, dict) else payload
-    return [row.get("name") for row in rows or [] if row.get("name")]
+def api_base(host: str) -> str:
+    value = str(host).strip()
+    if not value.startswith("http"):
+        value = "https://" + value
+    parts = urllib.parse.urlsplit(value)
+    return urllib.parse.urlunsplit((parts.scheme or "https", parts.netloc, "", "", ""))
+
+
+def vsphere_login(base: str, login: str, secret: str) -> tuple[str, str]:
+    """Сессия ESXi или vCenter. ESXi 6.5 отвечает на /rest, ESXi 7+ и vCenter — ещё и на /api."""
     token = b64encode(f"{login}:{secret}".encode()).decode()
-    for root in ("/api", "/rest"):
+    errors = []
+    for root, path in (("/api", "/session"), ("/rest", "/com/vmware/cis/session")):
         request = urllib.request.Request(
-            base.rstrip("/") + (root + "/session" if root == "/api" else root + "/com/vmware/cis/session"),
+            base.rstrip("/") + root + path,
+            data=b"",
             method="POST",
-            headers={"Authorization": f"Basic {token}"},
+            headers={"Authorization": f"Basic {token}", "Content-Type": "application/json"},
         )
         try:
             with urllib.request.urlopen(request, timeout=20, context=CTX) as response:
-                raw = response.read().decode()
-            session = json.loads(raw) if raw.startswith("{") else raw.strip().strip('"')
-            if isinstance(session, dict):
-                session = session.get("value", "")
-            return session, root
-        except urllib.error.HTTPError:
+                raw = response.read().decode().strip()
+        except urllib.error.HTTPError as error:
+            detail = error.read().decode(errors="replace")[:180].strip()
+            errors.append(f"{root} ответил {error.code}" + (f": {detail}" if detail else ""))
             continue
-    raise RuntimeError("сессия ESXi или vSphere не открылась")
+        except urllib.error.URLError as error:
+            errors.append(f"{root}: {error.reason}")
+            continue
+        session = json.loads(raw) if raw.startswith("{") else raw.strip('"')
+        if isinstance(session, dict):
+            session = session.get("value", "")
+        if session:
+            return str(session), root
+        errors.append(f"{root} не вернул сессию")
+    raise RuntimeError("ESXi или vSphere не пустил: " + "; ".join(errors))
+
+
+def list_vm_names(host: dict) -> list:
+    base = api_base(host["host"])
+    session, root = vsphere_login(base, host["login"], host["secret"])
+    payload = api(base, root, session, "/vcenter/vm")
+    rows = payload.get("value", payload) if isinstance(payload, dict) else payload
+    return [row.get("name") for row in rows or [] if isinstance(row, dict) and row.get("name")]
 
 
 def api(base: str, root: str, session: str, path: str, method="GET"):
