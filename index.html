@@ -127,7 +127,7 @@
   <div id="boot" class="login"><p class="muted mono">Открываем консоль…</p></div>
   <form id="login" class="login hidden">
     <div class="card">
-      <p class="eyebrow">1.2.0</p>
+      <p class="eyebrow">1.2.1</p>
       <h1 style="margin-top:12px">Консоль платформы</h1>
       <label class="lbl" for="login-name">Логин</label>
       <input id="login-name" autocomplete="username" style="margin-top:8px" />
@@ -140,7 +140,7 @@
   <div id="app" class="shell hidden">
     <aside>
       <div>
-        <p class="eyebrow" style="color:var(--rail-dim)">1.2.0</p>
+        <p class="eyebrow" style="color:var(--rail-dim)">1.2.1</p>
         <p style="margin:4px 0 0;font-size:18px;font-weight:600">Консоль 1С</p>
       </div>
       <nav class="nav" style="overflow:auto">
@@ -359,6 +359,8 @@
       $("who-name").textContent = state.me.name;
       $("who-login").textContent = state.me.login;
       $("must").classList.toggle("hidden", !state.me.mustChange);
+      const server = state.archives.server;
+      const client = state.archives.client;
       const thin = state.archives.thin;
       $("server-name").textContent = server ? server.fileName + " · " + server.count : "архив не загружен";
       $("client-name").textContent = client ? client.fileName + " · " + client.count : "архив не загружен";
@@ -399,8 +401,10 @@
     async function refresh() {
       try {
         render(await api("/api/state"));
-      } catch {
+      } catch (error) {
         show("login");
+        const message = error && error.message && error.message !== "Нужен вход." ? error.message : "";
+        if (message && $("login-error")) $("login-error").textContent = message;
       }
     }
 
