@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Консоль платформы 1С</title>
+  <title>Консоль платформы</title>
   <style>
     :root {
       --paper: #f3efe6;
@@ -127,7 +127,7 @@
   <div id="boot" class="login"><p class="muted mono">Открываем консоль…</p></div>
   <form id="login" class="login hidden">
     <div class="card">
-      <p class="eyebrow">1.2.3</p>
+      <p class="eyebrow">1.2.4</p>
       <h1 style="margin-top:12px">Консоль платформы</h1>
       <label class="lbl" for="login-name">Логин</label>
       <input id="login-name" autocomplete="username" style="margin-top:8px" />
@@ -140,8 +140,8 @@
   <div id="app" class="shell hidden">
     <aside>
       <div>
-        <p class="eyebrow" style="color:var(--rail-dim)">1.2.3</p>
-        <p style="margin:4px 0 0;font-size:18px;font-weight:600">Консоль 1С</p>
+        <p class="eyebrow" style="color:var(--rail-dim)">1.2.4</p>
+        <p style="margin:4px 0 0;font-size:18px;font-weight:600">Консоль платформы</p>
       </div>
       <nav class="nav" style="overflow:auto">
         <button type="button" data-tab="platform" class="on">Установка</button>
@@ -151,6 +151,7 @@
         <button type="button" data-tab="system">Система</button>
         <button type="button" data-tab="service">Обслуживание</button>
         <button type="button" data-tab="about">Релиз</button>
+        <button type="button" data-tab="changelog">История</button>
         <button type="button" data-tab="access">Доступ</button>
       </nav>
       <div class="who">
@@ -312,8 +313,8 @@
           <strong>Текущий релиз на GitHub</strong>
           <p id="rel-title" class="mono" style="color:var(--copper)"></p>
           <p id="rel-when" class="muted"></p>
-          <p id="rel-body" style="white-space:pre-wrap"></p>
-          <a id="rel-url" href="https://github.com/GrafAtRuss/server">Открыть на GitHub</a>
+          <div id="rel-body" style="white-space:pre-wrap"></div>
+          <a id="rel-url" href="https://github.com/GrafAtRuss/server" target="_blank" rel="noopener noreferrer">Открыть на GitHub</a>
         </div>
         <aside class="panel" style="background:var(--rail);color:var(--rail-fg)">
           <div style="display:inline-block;background:#fff;border-radius:12px;padding:12px">
@@ -324,6 +325,14 @@
           <p><a href="mailto:Info@ip-ermakov.ru" style="color:inherit">Info@ip-ermakov.ru</a></p>
           <p><a href="tel:+79918661848" style="color:inherit">+7-991-866-1848</a></p>
         </aside>
+      </section>
+      <section id="tab-changelog" class="hidden">
+        <div class="panel">
+          <strong>История изменений</strong>
+          <p class="muted">Текст читается из CHANGELOG.md на GitHub.</p>
+          <div id="log-body" style="margin-top:16px"></div>
+          <a id="log-url" href="https://github.com/GrafAtRuss/server/blob/main/CHANGELOG.md" target="_blank" rel="noopener noreferrer">Открыть на GitHub</a>
+        </div>
       </section>
       <section id="tab-access" class="hidden">
         <div class="forms">
@@ -446,7 +455,7 @@
         document.querySelectorAll("[data-tab]").forEach((item) => item.classList.toggle("on", item === button));
         const titles = {
           platform: "Установка платформы", bases: "Информационные базы", storages: "Хранилища",
-          vms: "Виртуальные машины", system: "Система и сеть", service: "Обслуживание", about: "Релиз", access: "Операторы"
+          vms: "Виртуальные машины", system: "Система и сеть", service: "Обслуживание", about: "Релиз", changelog: "История", access: "Операторы"
         };
         const leads = {
           platform: "Сервер, толстый и тонкий клиент ставятся одним запуском.",
@@ -455,11 +464,12 @@
           vms: "Гипервизор запоминается. Машину выбирают из списка.",
           system: "Имя хоста, пояс, адрес интерфейса, шлюз, DNS и правила фаервола.",
           service: "Перезагрузка, выключение и обновление с GitHub.",
-          about: "Страница читает релиз из GitHub, а не из самой программы.",
+          about: "Описание читается из README.md на GitHub.",
+          changelog: "История версий читается из CHANGELOG.md на GitHub.",
           access: "Несколько операторов. Каждый меняет только свой пароль."
         };
         const tab = button.dataset.tab;
-        ["platform", "bases", "storages", "vms", "system", "service", "about", "access"].forEach((name) => {
+        ["platform", "bases", "storages", "vms", "system", "service", "about", "changelog", "access"].forEach((name) => {
           $("tab-" + name).classList.toggle("hidden", name !== tab);
         });
         $("title").textContent = titles[tab];
@@ -467,6 +477,7 @@
         if (tab === "system") loadSystem();
         if (tab === "service") loadUpdateLog();
         if (tab === "about") loadRelease();
+        if (tab === "changelog") loadChangelog();
       });
     });
 
@@ -764,15 +775,44 @@
       }
     });
 
+    function renderMd(source) {
+      const chunks = String(source || "").split("```");
+      return chunks.map((chunk, index) => {
+        if (index % 2 === 1) return "<pre class='log'>" + esc(chunk.replace(/^[a-zA-Z0-9_-]*\n/, "")) + "</pre>";
+        let html = esc(chunk);
+        html = html.replace(/^#### (.*)$/gm, "<h4>$1</h4>");
+        html = html.replace(/^### (.*)$/gm, "<h3>$1</h3>");
+        html = html.replace(/^## (.*)$/gm, "<h2>$1</h2>");
+        html = html.replace(/^# (.*)$/gm, "<h2>$1</h2>");
+        html = html.replace(/`([^`]+)`/g, "<code>$1</code>");
+        html = html.replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, (match, label, url) => {
+          const blank = /github\.com/i.test(url) ? " target=\"_blank\" rel=\"noopener noreferrer\"" : "";
+          return "<a href=\"" + url + "\"" + blank + ">" + label + "</a>";
+        });
+        html = html.replace(/^(?:- |\d+\. )(.*)$/gm, "<div>• $1</div>");
+        return html.replace(/\n{2,}/g, "<br><br>").replace(/\n/g, "<br>");
+      }).join("");
+    }
+
     async function loadRelease() {
       try {
         const data = await api("/api/release");
-        $("rel-title").textContent = data.error || data.title || "";
+        $("rel-title").textContent = data.title || "";
         $("rel-when").textContent = data.when || "";
-        $("rel-body").textContent = data.body || "";
+        $("rel-body").innerHTML = data.body ? renderMd(data.body) : esc(data.error || "");
         if (data.url) $("rel-url").href = data.url;
       } catch (error) {
         $("rel-title").textContent = error.message;
+      }
+    }
+
+    async function loadChangelog() {
+      try {
+        const data = await api("/api/changelog");
+        $("log-body").innerHTML = data.body ? renderMd(data.body) : esc(data.error || "");
+        if (data.url) $("log-url").href = data.url;
+      } catch (error) {
+        $("log-body").textContent = error.message;
       }
     }
 

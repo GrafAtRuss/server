@@ -1,4 +1,4 @@
-# Консоль 1.2.3
+# Консоль платформы 1.2.4
 
 Веб-консоль для Ubuntu 24.04: установка платформы 1С, бекап конфигураций, диски и облака, бекап виртуальных машин ESXi и vSphere.
 
@@ -12,7 +12,7 @@ sudo apt-get install -y git python3 cifs-utils nfs-common sshpass
 git clone https://github.com/GrafAtRuss/server.git
 cd server
 sudo ./build-deb.sh
-sudo dpkg -i onec-console_1.2.3_all.deb
+sudo dpkg -i onec-console_1.2.4_all.deb
 sudo cat /etc/onec-console/initial-password
 ```
 
@@ -30,7 +30,7 @@ sudo ufw allow 8780/tcp
 cd server
 git pull
 sudo ./build-deb.sh
-sudo dpkg -i onec-console_1.2.3_all.deb
+sudo dpkg -i onec-console_1.2.4_all.deb
 ```
 
 Пароль при обновлении не сбрасывается.
@@ -43,7 +43,7 @@ sudo dpkg -i onec-console_1.2.3_all.deb
 4. **Машины.** ESXi или vSphere запоминается, машина выбирается из списка. Перед копией она мягко выключается, после копии включается. Копия файлов с ESXi требует `sshpass`.
 5. **Система.** Имя хоста, часовой пояс, NTP, DNS, фаервол, SSH и локаль.
 6. **Обслуживание.** Перезагрузка, выключение и обновление кода с GitHub.
-7. **Релиз.** Текущий релиз читается с GitHub.
+7. **Релиз.** Описание читается из этого README на GitHub. История версий — из [CHANGELOG.md](https://github.com/GrafAtRuss/server/blob/main/CHANGELOG.md).
 
 Служба называется `onec-console` и слушает порт 8780.
 

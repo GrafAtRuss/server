@@ -19,6 +19,7 @@ from hostadmin import (
     apply_system,
     backup_dir,
     cluster_catalog,
+    github_changelog,
     github_release,
     new_stamp,
     prune,
@@ -28,7 +29,7 @@ from hostadmin import (
     vm_catalog,
 )
 
-PRODUCT_VERSION = "1.2.3"
+PRODUCT_VERSION = "1.2.4"
 
 STATE_DIR = Path(os.environ.get("ONEC_STATE_DIR", "/var/lib/onec-console"))
 CACHE_DIR = Path(os.environ.get("ONEC_CACHE_DIR", "/var/cache/onec-platform"))
@@ -292,11 +293,17 @@ class Handler(BaseHTTPRequestHandler):
                 },
             )
             return
-        if path in ("/api/system", "/api/release"):
+        if path in ("/api/system", "/api/release", "/api/changelog"):
             user = self._guard(state)
             if not user:
                 return
-            self._send(200, read_system() if path == "/api/system" else github_release())
+            if path == "/api/system":
+                payload = read_system()
+            elif path == "/api/release":
+                payload = github_release()
+            else:
+                payload = github_changelog()
+            self._send(200, payload)
             return
         self._send(404, {"error": "Не найдено."})
 

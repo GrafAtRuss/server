@@ -15,7 +15,8 @@ from ops import MOUNT_ROOT, list_vm_names, safe_name
 
 REPO = "https://github.com/GrafAtRuss/server.git"
 SRC = Path("/opt/onec-console-src")
-GITHUB_API = "https://api.github.com/repos/GrafAtRuss/server"
+RAW = "https://raw.githubusercontent.com/GrafAtRuss/server/main"
+WEB = "https://github.com/GrafAtRuss/server"
 
 
 def command(args: list, timeout: int = 20) -> tuple[int, str]:
@@ -427,12 +428,19 @@ def schedule_power(action: str) -> str:
     return f"{action} через несколько секунд"
 
 
+def github_text(name: str) -> str:
+    request = urllib.request.Request(f"{RAW}/{name}", headers={"User-Agent": "onec-console"})
+    with urllib.request.urlopen(request, timeout=15) as response:
+        return response.read().decode()
+
+
 def github_release() -> dict:
     if os.environ.get("ONEC_RELEASE") == "skip":
-        return {"title": "v1.2.0", "body": "тест", "url": REPO, "when": "", "source": "release"}
+        return {"title": "v1.2.4", "body": "тест", "url": WEB, "when": "", "source": "readme"}
+    meta = {"title": "", "url": WEB, "when": "", "source": "readme"}
     for path, source in (("releases/latest", "release"), ("commits/main", "commit")):
         request = urllib.request.Request(
-            f"{GITHUB_API}/{path}",
+            f"https://api.github.com/repos/GrafAtRuss/server/{path}",
             headers={"User-Agent": "onec-console", "Accept": "application/vnd.github+json"},
         )
         try:
@@ -441,23 +449,42 @@ def github_release() -> dict:
         except urllib.error.HTTPError:
             continue
         except OSError as error:
-            return {"error": str(error)}
+            return {"error": str(error), "body": "", "url": WEB}
         if source == "release":
-            return {
-                "title": data.get("tag_name") or data.get("name"),
-                "body": data.get("body") or "",
-                "url": data.get("html_url") or REPO,
+            meta = {
+                "title": data.get("tag_name") or data.get("name") or "",
+                "url": data.get("html_url") or WEB,
                 "when": data.get("published_at") or "",
-                "source": "release",
+                "source": "readme",
             }
-        return {
-            "title": (data.get("sha") or "")[:7],
-            "body": (data.get("commit") or {}).get("message") or "",
-            "url": data.get("html_url") or REPO,
-            "when": ((data.get("commit") or {}).get("committer") or {}).get("date") or "",
-            "source": "commit",
-        }
-    return {"error": "GitHub не ответил."}
+        else:
+            meta = {
+                "title": (data.get("sha") or "")[:7],
+                "url": data.get("html_url") or WEB,
+                "when": ((data.get("commit") or {}).get("committer") or {}).get("date") or "",
+                "source": "readme",
+            }
+        break
+    else:
+        return {"error": "GitHub не ответил.", "body": "", "url": WEB}
+    try:
+        meta["body"] = github_text("README.md")
+    except urllib.error.HTTPError as error:
+        return {**meta, "body": "", "error": f"README.md не прочитан: {error.code}"}
+    except OSError as error:
+        return {**meta, "body": "", "error": str(error)}
+    return meta
+
+
+def github_changelog() -> dict:
+    if os.environ.get("ONEC_RELEASE") == "skip":
+        return {"body": "## 1.2.4\n\nтест", "url": f"{WEB}/blob/main/CHANGELOG.md"}
+    try:
+        return {"body": github_text("CHANGELOG.md"), "url": f"{WEB}/blob/main/CHANGELOG.md"}
+    except urllib.error.HTTPError as error:
+        return {"error": f"CHANGELOG.md не прочитан: {error.code}", "url": f"{WEB}/blob/main/CHANGELOG.md"}
+    except OSError as error:
+        return {"error": str(error), "url": f"{WEB}/blob/main/CHANGELOG.md"}
 
 
 def rac_path(installed: dict | None) -> str | None:
