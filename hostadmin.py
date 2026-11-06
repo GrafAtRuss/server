@@ -495,6 +495,13 @@ def rac_path(installed: dict | None) -> str | None:
     return shutil.which("rac")
 
 
+def cluster_auth(cluster: dict) -> list:
+    login = str(cluster.get("login") or "")
+    if not login:
+        return []
+    return [f"--cluster-user={login}", f"--cluster-pwd={cluster.get('secret', '')}"]
+
+
 def cluster_catalog(cluster: dict, installed: dict | None) -> list:
     if os.environ.get("ONEC_RAC") == "skip":
         return ["trade", "accounting"]
@@ -502,9 +509,12 @@ def cluster_catalog(cluster: dict, installed: dict | None) -> list:
     if not rac:
         raise RuntimeError("rac не найден. Сначала установите сервер 1С.")
     target = f"{cluster['host']}:{cluster.get('port') or 1545}"
+    auth = cluster_auth(cluster)
     code, text = command([rac, "cluster", "list", target], timeout=30)
+    if code != 0 and auth:
+        code, text = command([rac, "cluster", "list", *auth, target], timeout=30)
     if code != 0:
-        raise RuntimeError(text or "кластер не ответил")
+        raise RuntimeError(auth_hint(text) or "кластер не ответил")
     cluster_id = ""
     for line in text.splitlines():
         if line.strip().lower().startswith("cluster"):
@@ -512,18 +522,26 @@ def cluster_catalog(cluster: dict, installed: dict | None) -> list:
             break
     if not cluster_id:
         raise RuntimeError("в ответе rac нет идентификатора кластера")
-    args = [rac, "infobase", f"--cluster={cluster_id}", "summary", "list", target]
-    if cluster.get("login"):
-        args[2:2] = [f"--cluster-user={cluster['login']}", f"--cluster-pwd={cluster.get('secret', '')}"]
+    # Параметры аутентификации должны стоять после summary list, иначе rac их не применяет.
+    args = [rac, "infobase", "summary", "list", f"--cluster={cluster_id}", *auth, target]
     code, text = command(args, timeout=40)
     if code != 0:
-        raise RuntimeError(text or "список баз не получен")
+        raise RuntimeError(auth_hint(text) or "список баз не получен")
     names = []
     for line in text.splitlines():
         lowered = line.strip().lower()
         if lowered.startswith("name") or lowered.startswith("имя"):
             names.append(line.split(":", 1)[-1].strip())
     return names
+
+
+def auth_hint(text: str) -> str:
+    if "не аутентифицирован" in text.lower() or "not authenticated" in text.lower():
+        return (
+            text
+            + " Нужен администратор кластера с паролем 1С, не пользователь базы и не учётная запись Windows."
+        )
+    return text
 
 
 def vm_catalog(host: dict) -> list:

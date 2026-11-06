@@ -182,16 +182,19 @@ def api_base(host: str) -> str:
 
 
 def vsphere_login(base: str, login: str, secret: str) -> tuple[str, str]:
-    """Сессия ESXi или vCenter. ESXi 6.5 отвечает на /rest, ESXi 7+ и vCenter — ещё и на /api."""
+    """Сессия ESXi или vCenter. ESXi 6.7 требует заголовок без тела, ESXi 7+ отвечает и на /api."""
     token = b64encode(f"{login}:{secret}".encode()).decode()
     errors = []
-    for root, path in (("/api", "/session"), ("/rest", "/com/vmware/cis/session")):
-        request = urllib.request.Request(
-            base.rstrip("/") + root + path,
-            data=b"",
-            method="POST",
-            headers={"Authorization": f"Basic {token}", "Content-Type": "application/json"},
-        )
+    attempts = (
+        ("/rest", "/com/vmware/cis/session", True),
+        ("/api", "/session", True),
+        ("/rest", "/com/vmware/cis/session", False),
+    )
+    for root, path, header_auth in attempts:
+        headers = {"Authorization": f"Basic {token}", "Accept": "application/json", "User-Agent": "onec-console"}
+        if header_auth:
+            headers["vmware-use-header-authn"] = "true"
+        request = urllib.request.Request(base.rstrip("/") + root + path, method="POST", headers=headers)
         try:
             with urllib.request.urlopen(request, timeout=20, context=CTX) as response:
                 raw = response.read().decode().strip()
