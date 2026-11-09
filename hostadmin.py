@@ -425,6 +425,7 @@ def schedule_update() -> str:
     script_path.write_text(
         f"""#!/bin/bash
 set -eu
+export HOME=/root
 exec >> {log_path} 2>&1
 echo "--- $(date -Is) ---"
 git config --global --add safe.directory {SRC} || true
@@ -432,7 +433,8 @@ if [ ! -d {SRC}/.git ]; then
   rm -rf {SRC}
   git clone {REPO} {SRC}
 fi
-git -C {SRC} pull --ff-only
+git -C {SRC} fetch origin
+git -C {SRC} reset --hard origin/main
 chmod +x {SRC}/build-deb.sh {SRC}/install-sql.sh
 {SRC}/install-sql.sh || true
 deb=$({SRC}/build-deb.sh | tail -n 1)
