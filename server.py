@@ -32,11 +32,12 @@ from hostadmin import (
     sql_catalog,
     update_offer,
     vm_catalog,
+    ensure_onec_runtime,
     ensure_soname,
 )
 from ops import deliver, list_storage, probe, public_copy, run_vm, schedule_due
 
-PRODUCT_VERSION = "1.2.19"
+PRODUCT_VERSION = "1.2.20"
 LOGIN_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
 
 STATE_DIR = Path(os.environ.get("ONEC_STATE_DIR", "/var/lib/onec-console"))
@@ -720,7 +721,7 @@ class Handler(BaseHTTPRequestHandler):
         apt = subprocess.run(["apt-get", "install", "-f", "-y"], text=True, capture_output=True, check=False)
         tail = (apt.stdout + apt.stderr).strip().splitlines()
         log.extend(tail[-8:])
-        log.append(ensure_soname("libcups.so.2"))
+        log.append(ensure_onec_runtime())
         binary = Path(f"/opt/1cv8/x86_64/{version}/1cv8")
         log.append(f"проверка  test -x {binary}")
         installed = None
@@ -1170,7 +1171,7 @@ def perform_backup(state: dict, job: dict) -> list:
                 (stamp / "config.cf").write_text(f"dump {target}\n", encoding="utf-8")
                 log = [f"папка создана: {parent}", f"бекап {target} → {stamp}"]
             else:
-                notes = [ensure_soname("libcups.so.2")]
+                notes = [ensure_onec_runtime()]
                 output = ""
                 code = 1
                 for _ in range(4):

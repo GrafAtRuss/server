@@ -23,6 +23,20 @@ SONAME_PACKAGES = {
     "libcups.so.2": ("libcups2t64", "libcups2"),
     "libgtk-3.so.0": ("libgtk-3-0t64", "libgtk-3-0"),
     "libgdk-3.so.0": ("libgtk-3-0t64", "libgtk-3-0"),
+    "libSM.so.6": ("libsm6",),
+    "libICE.so.6": ("libice6",),
+    "libX11.so.6": ("libx11-6",),
+    "libXext.so.6": ("libxext6",),
+    "libXrender.so.1": ("libxrender1",),
+    "libXtst.so.6": ("libxtst6",),
+    "libXi.so.6": ("libxi6",),
+    "libXrandr.so.2": ("libxrandr2",),
+    "libXinerama.so.1": ("libxinerama1",),
+    "libXcursor.so.1": ("libxcursor1",),
+    "libXfixes.so.3": ("libxfixes3",),
+    "libXss.so.1": ("libxss1",),
+    "libXt.so.6": ("libxt6",),
+    "libXft.so.2": ("libxft2",),
     "libfontconfig.so.1": ("libfontconfig1",),
     "libgsf-1.so.114": ("libgsf-1-114",),
     "libenchant-2.so.2": ("libenchant-2-2",),
@@ -31,30 +45,96 @@ SONAME_PACKAGES = {
     "libwebkit2gtk-4.0.so.37": ("libwebkit2gtk-4.0-37",),
 }
 
+RUNTIME_PACKAGES = (
+    "libsm6",
+    "libice6",
+    "libx11-6",
+    "libxext6",
+    "libxrender1",
+    "libxtst6",
+    "libxi6",
+    "libxrandr2",
+    "libxinerama1",
+    "libxcursor1",
+    "libxfixes3",
+    "libxss1",
+    "libxt6",
+    "libxft2",
+    "libxkbcommon0",
+    "libfontconfig1",
+    "libfreetype6",
+    "libjpeg-turbo8",
+    "libtiff6",
+    "libpango-1.0-0",
+    "libcairo2",
+    "libgdk-pixbuf-2.0-0",
+    "libenchant-2-2",
+    "libgsf-1-114",
+    "libxslt1.1",
+    "libxml2",
+    "libsecret-1-0",
+    "libkrb5-3",
+    "unixodbc",
+    "fonts-dejavu-core",
+)
 
-def ensure_soname(soname: str) -> str:
-    packages = SONAME_PACKAGES.get(soname)
-    if not packages:
-        return f"нет пакета для {soname}"
+
+def package_guesses(soname: str) -> tuple:
+    known = SONAME_PACKAGES.get(soname)
+    if known:
+        return known
+    base = soname.split(".so", 1)[0].lower()
+    major = soname.rsplit(".", 1)[-1] if ".so." in soname else ""
+    names = []
+    if major.isdigit():
+        names.append(f"{base}{major}")
+    names.append(base)
+    return tuple(dict.fromkeys(names))
+
+
+def apt_install(packages: list) -> bool:
     if os.environ.get("ONEC_PROBE") == "skip":
-        return f"пакет для {soname} отложен"
+        return True
     env = os.environ.copy()
     env["DEBIAN_FRONTEND"] = "noninteractive"
-    error = ""
+    result = subprocess.run(
+        ["apt-get", "install", "-y", *packages],
+        text=True,
+        capture_output=True,
+        check=False,
+        env=env,
+        timeout=600,
+    )
+    return result.returncode == 0
+
+
+def ensure_onec_runtime() -> str:
+    if os.environ.get("ONEC_PROBE") == "skip":
+        return "библиотеки клиента 1С отложены"
+    apt_install(["libsm6", "libice6", "libx11-6", "libxext6", "libxrender1", "libxt6", "libxft2", "libxtst6"])
+    apt_install(list(RUNTIME_PACKAGES))
+    for options in (
+        ("libcups2t64", "libcups2"),
+        ("libgtk-3-0t64", "libgtk-3-0"),
+        ("libpng16-16t64", "libpng16-16"),
+        ("libglib2.0-0t64", "libglib2.0-0"),
+        ("libatk1.0-0t64", "libatk1.0-0"),
+        ("libatk-bridge2.0-0t64", "libatk-bridge2.0-0"),
+    ):
+        for package in options:
+            if apt_install([package]):
+                break
+    return "библиотеки клиента 1С проверены"
+
+
+def ensure_soname(soname: str) -> str:
+    packages = package_guesses(soname)
+    if os.environ.get("ONEC_PROBE") == "skip":
+        return f"пакет для {soname} отложен"
     for package in packages:
-        result = subprocess.run(
-            ["apt-get", "install", "-y", package],
-            text=True,
-            capture_output=True,
-            check=False,
-            env=env,
-            timeout=300,
-        )
-        if result.returncode == 0:
+        if apt_install([package]):
             return f"установлен {package}"
-        text = (result.stderr or result.stdout or "").strip().splitlines()
-        error = text[-1] if text else package
-    return f"не установлен {soname}: {error}"
+    return f"не установлен {soname}"
 
 
 def command(args: list, timeout: int = 20) -> tuple[int, str]:
