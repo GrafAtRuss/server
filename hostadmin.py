@@ -124,6 +124,7 @@ def ensure_onec_runtime() -> str:
         for package in options:
             if apt_install([package]):
                 break
+    apt_install(["xvfb"])
     return "библиотеки клиента 1С проверены"
 
 
@@ -892,15 +893,136 @@ def cifs_unc(endpoint: str, relative: str) -> str:
     return "\\\\" + "\\".join(parts + extra)
 
 
-def sql_target(server: dict, storage: dict, stamp: Path, file_name: str) -> str:
-    host = str(server.get("host", "")).strip().lower()
+def sql_machine(server: dict) -> str:
+    host = str(server.get("host", "")).strip()
+    return host.split("\\", 1)[0].split(",", 1)[0].strip()
+
+
+def remote_sql(server: dict) -> bool:
+    return sql_machine(server).lower() not in ("localhost", "127.0.0.1", "::1", "")
+
+
+def sql_target(server: dict, storage: dict, stamp: Path, file_name: str, database: str) -> tuple:
     if storage.get("kind") == "cifs":
         root = (MOUNT_ROOT / storage["id"]).resolve()
         relative = stamp.resolve().relative_to(root).as_posix()
-        return cifs_unc(storage.get("endpoint", ""), relative) + "\\" + file_name
-    if host in ("localhost", "127.0.0.1", "::1"):
-        return str(stamp / file_name)
-    raise RuntimeError("Удалённый SQL Server записывает bak на диск CIFS. Подключите такой диск или укажите SQL на этой же машине.")
+        return cifs_unc(storage.get("endpoint", ""), relative) + "\\" + file_name, False
+    local = stamp / file_name
+    if not remote_sql(server):
+        return str(local), False
+    remote = f"C:\\onec-backup\\{safe_name(database)}\\{file_name}"
+    return remote, True
+
+
+def pull_bak(server: dict, remote: str, local: Path) -> str:
+    errors = []
+    try:
+        pull_bak_smb(server, remote, local)
+        return f"файл забран с {sql_machine(server)} в {local}"
+    except Exception as error:
+        errors.append(f"SMB: {error}")
+    try:
+        pull_bak_sql(server, remote, local)
+        return f"файл прочитан через SQL в {local}"
+    except Exception as error:
+        errors.append(f"SQL: {error}")
+    raise RuntimeError(
+        f"bak лежит на SQL Server: {remote}. Не удалось забрать его ({'; '.join(errors)}). "
+        "Укажите логин Windows с доступом к диску C: или подключите хранилище CIFS."
+    )
+
+
+def pull_bak_smb(server: dict, remote: str, local: Path) -> None:
+    if not remote.lower().startswith("c:\\"):
+        raise RuntimeError("путь не на диске C:")
+    if shutil.which("smbclient") is None and not apt_install(["smbclient"]):
+        raise RuntimeError("нет smbclient")
+    login = str(server.get("fileLogin") or server.get("login") or "").strip()
+    secret = str(server.get("fileSecret") or ("" if server.get("fileLogin") else server.get("secret", "")))
+    domain = ""
+    user = login
+    if "\\" in login:
+        domain, user = login.split("\\", 1)
+    auth = Path(f"/tmp/onec-smb-{os.getpid()}.auth")
+    lines = [f"username = {user}", f"password = {secret}"]
+    if domain:
+        lines.append(f"domain = {domain}")
+    auth.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    auth.chmod(0o600)
+    relative = remote[3:].replace("\\", "/")
+    local.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        result = subprocess.run(
+            [
+                "smbclient",
+                f"//{sql_machine(server)}/C$",
+                "-A",
+                str(auth),
+                "-c",
+                f'get "{relative}" "{local}"',
+            ],
+            text=True,
+            capture_output=True,
+            timeout=7200,
+            check=False,
+        )
+    finally:
+        auth.unlink(missing_ok=True)
+    if result.returncode != 0 or not local.is_file():
+        detail = (result.stderr or result.stdout or "smbclient не скопировал файл").strip()
+        raise RuntimeError(detail[:300])
+
+
+def pull_bak_sql(server: dict, remote: str, local: Path) -> None:
+    folder, _, name = remote.rpartition("\\")
+    try:
+        listed = sql_exec(
+            server,
+            "SELECT CAST(size AS varchar(40)) FROM sys.dm_os_enumerate_filesystem("
+            f"N'{folder.replace(chr(39), chr(39) * 2)}', N'{name.replace(chr(39), chr(39) * 2)}')",
+            timeout=60,
+        )
+        size = int("".join(ch for ch in listed if ch.isdigit()) or "0")
+        if size > 1500 * 1024 * 1024:
+            raise RuntimeError("файл больше 1.5 ГБ, нужен логин Windows")
+    except RuntimeError as error:
+        if "логин Windows" in str(error):
+            raise
+    except Exception:
+        pass
+    try:
+        sql_exec(
+            server,
+            "EXEC sp_configure 'show advanced options', 1; RECONFIGURE; "
+            "EXEC sp_configure 'Ad Hoc Distributed Queries', 1; RECONFIGURE;",
+            timeout=60,
+        )
+    except Exception:
+        pass
+    import pymssql
+
+    host = str(server.get("host", "")).strip()
+    connection = pymssql.connect(
+        server=host,
+        port=int(server.get("port") or 1433),
+        user=str(server.get("login", "")),
+        password=str(server.get("secret", "")),
+        login_timeout=20,
+        timeout=7200,
+    )
+    try:
+        cursor = connection.cursor()
+        literal = remote.replace("'", "''")
+        cursor.execute(f"SELECT BulkColumn FROM OPENROWSET(BULK N'{literal}', SINGLE_BLOB) AS doc")
+        row = cursor.fetchone()
+    finally:
+        connection.close()
+    if not row or row[0] is None:
+        raise RuntimeError("SQL не вернул файл")
+    payload = row[0]
+    if isinstance(payload, str):
+        payload = payload.encode("latin1", errors="ignore")
+    local.write_bytes(bytes(payload))
 
 
 def sql_backup(server: dict, database: str, storage: dict, stamp: Path) -> str:
@@ -908,7 +1030,7 @@ def sql_backup(server: dict, database: str, storage: dict, stamp: Path) -> str:
     if os.environ.get("ONEC_SQL") == "skip":
         (stamp / file_name).write_text("sql\n", encoding="utf-8")
         return f"бекап {database} → {stamp / file_name}"
-    target = sql_target(server, storage, stamp, file_name)
+    target, fetch = sql_target(server, storage, stamp, file_name, database)
     folder = target.rsplit("\\", 1)[0] if "\\" in target else str(Path(target).parent)
     try:
         sql_exec(server, f"EXEC master.dbo.xp_create_subdir N'{folder.replace(chr(39), chr(39) * 2)}'", timeout=60)
@@ -922,4 +1044,8 @@ def sql_backup(server: dict, database: str, storage: dict, stamp: Path) -> str:
         if "compression" not in str(error).lower():
             raise
         sql_exec(server, f"BACKUP DATABASE {sql_ident(database)} TO DISK = N'{literal}' WITH COPY_ONLY, INIT", timeout=7200)
-    return f"бекап {database} → {target}"
+    if not fetch:
+        return f"бекап {database} → {target}"
+    local = stamp / file_name
+    note = pull_bak(server, target, local)
+    return f"бекап {database} → {target}; {note}"

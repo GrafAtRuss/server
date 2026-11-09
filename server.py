@@ -35,10 +35,11 @@ from hostadmin import (
     vm_catalog,
     ensure_onec_runtime,
     ensure_soname,
+    apt_install,
 )
 from ops import deliver, list_storage, probe, public_copy, run_vm, schedule_due
 
-PRODUCT_VERSION = "1.2.21"
+PRODUCT_VERSION = "1.2.22"
 LOGIN_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
 
 STATE_DIR = Path(os.environ.get("ONEC_STATE_DIR", "/var/lib/onec-console"))
@@ -993,6 +994,8 @@ class Handler(BaseHTTPRequestHandler):
                 "port": str(payload.get("port") or "1433"),
                 "login": login,
                 "secret": secret,
+                "fileLogin": str(payload.get("fileLogin", "")).strip(),
+                "fileSecret": str(payload.get("fileSecret", "")),
                 "catalog": [],
                 "catalogError": "",
             }
@@ -1279,14 +1282,25 @@ def dump_config(binary: str, cluster: dict, target: str, stamp: Path, progress) 
     output = ""
     for _ in range(4):
         progress(22, "запуск конфигуратора", f"запускаю конфигуратор для {target}")
+        command = [
+            binary, "DESIGNER", "/S", target, "/N", cluster.get("login", ""), "/P", cluster.get("secret", ""),
+            "/DisableStartupDialogs", "/DumpCfg", str(stamp / "config.cf"),
+        ]
+        env = os.environ.copy()
+        env.setdefault("HOME", "/root")
+        env.setdefault("GDK_BACKEND", "x11")
+        if not env.get("DISPLAY"):
+            if shutil.which("xvfb-run") is None:
+                apt_install(["xvfb"])
+            if shutil.which("xvfb-run"):
+                command = ["xvfb-run", "-a", *command]
+                progress(22, "виртуальный экран", "экран не найден, запускаю через xvfb")
         proc = subprocess.Popen(
-            [
-                binary, "DESIGNER", "/S", target, "/N", cluster.get("login", ""), "/P", cluster.get("secret", ""),
-                "/DisableStartupDialogs", "/DumpCfg", str(stamp / "config.cf"),
-            ],
+            command,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
+            env=env,
         )
         captured = []
 

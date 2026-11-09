@@ -96,7 +96,7 @@ def split_host(endpoint: str, default_port: int) -> tuple[str, int]:
 
 
 def public_copy(items: list) -> list:
-    hidden = {"secret"}
+    hidden = {"secret", "fileSecret"}
     return [{key: value for key, value in item.items() if key not in hidden} for item in items]
 
 

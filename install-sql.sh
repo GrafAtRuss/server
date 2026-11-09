@@ -11,7 +11,7 @@ while [ "$i" -lt 60 ]; do
   sleep 2
 done
 apt-get update || true
-apt-get install -y libsm6 libice6 libx11-6 libxext6 libxrender1 libxtst6 libxi6 libxrandr2 libxinerama1 libxcursor1 libxfixes3 libxss1 libxt6 libxft2 libfontconfig1 libfreetype6 fonts-dejavu-core || true
+apt-get install -y libsm6 libice6 libx11-6 libxext6 libxrender1 libxtst6 libxi6 libxrandr2 libxinerama1 libxcursor1 libxfixes3 libxss1 libxt6 libxft2 libfontconfig1 libfreetype6 fonts-dejavu-core xvfb smbclient || true
 apt-get install -y libcups2t64 || apt-get install -y libcups2 || true
 apt-get install -y libgtk-3-0t64 || apt-get install -y libgtk-3-0 || true
 if python3 -c 'import pymssql' >/dev/null 2>&1; then
