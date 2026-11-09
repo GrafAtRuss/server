@@ -128,7 +128,7 @@
   <div id="boot" class="login"><p class="muted mono">Открываем консоль…</p></div>
   <form id="login" class="login hidden">
     <div class="card">
-      <p class="eyebrow">1.2.23</p>
+      <p class="eyebrow">1.2.24</p>
       <h1 style="margin-top:12px">Консоль платформы</h1>
       <label class="lbl" for="login-name">Логин</label>
       <input id="login-name" autocomplete="username" style="margin-top:8px" />
@@ -141,7 +141,7 @@
   <div id="app" class="shell hidden">
     <aside>
       <div>
-        <p class="eyebrow" style="color:var(--rail-dim)">1.2.23</p>
+        <p class="eyebrow" style="color:var(--rail-dim)">1.2.24</p>
         <p style="margin:4px 0 0;font-size:18px;font-weight:600">Консоль платформы</p>
       </div>
       <nav class="nav" style="overflow:auto">
@@ -460,14 +460,20 @@
         const details = active
           ? `<div class="meter" data-job-bar="${job.id}"><span style="width:${pct}%"></span></div><p class="muted" data-job-phase="${job.id}">${pct}% · ${esc(job.phase || (job.running ? "запуск" : ""))}</p><pre class="log" data-job-log="${job.id}" style="min-height:0">${esc(shown)}</pre>`
           : "";
-        return `<div${job.running ? ' data-live="1"' : ""}><p>${when} · ${place}${cloud} · хранить ${sched.keepDays ?? 14} дн. <button class="ghost" type="button" data-run="${job.id}">${job.running ? "Идёт…" : "Запустить"}</button> <button class="ghost" type="button" data-drop="backup-jobs:${job.id}">Удалить</button></p>${details}</div>`;
+        const user = job.kind === "base"
+          ? `<label class="lbl">Пользователь базы</label><input data-base-login="${job.id}" value="${esc(job.baseLogin || "")}" placeholder="Пользователь информационной базы" /><label class="lbl">Пароль пользователя базы</label><input type="password" data-base-secret="${job.id}" placeholder="Пароль базы" /><button class="ghost" type="button" data-base-save="${job.id}">Сохранить пользователя базы</button>`
+          : "";
+        return `<div${job.running ? ' data-live="1"' : ""}><p>${when} · ${place}${cloud} · хранить ${sched.keepDays ?? 14} дн. <button class="ghost" type="button" data-run="${job.id}">${job.running ? "Идёт…" : "Запустить"}</button> <button class="ghost" type="button" data-drop="backup-jobs:${job.id}">Удалить</button></p><div class="stack">${user}</div>${details}</div>`;
       };
       const jobForm = (id, kind) => {
         const dayButtons = days.map((label, index) => `<button class="ghost" type="button" data-day="${index}" data-day-for="${id}" data-on="${index < 5 ? "1" : "0"}" style="${index < 5 ? "background:var(--pine);color:#fff" : ""}">${label}</button>`).join("");
         const cloud = clouds.length
           ? `<div>${clouds.map((item) => `<label><input type="checkbox" data-cloud-for="${id}" value="${esc(item.id)}"> ${esc(item.name)}</label>`).join(" ")}</div><input data-cloud-folder="${id}" placeholder="Папка в облаке" />`
           : `<p class="muted">Облако не подключено — копия только на диск.</p>`;
-        return `<div class="stack"><select data-disk="${id}">${diskOptions}</select><input data-folder="${id}" placeholder="Папка в хранилище" /><label><input type="checkbox" data-sched="${id}" checked> По расписанию</label><div>${dayButtons}</div><input data-time="${id}" type="time" value="02:00" /><input data-keep="${id}" type="number" min="0" value="14" />${cloud}<button class="primary" type="button" data-add="${kind}" data-target="${id}">Добавить бекап</button></div>`;
+        const baseUser = kind === "base"
+          ? `<label class="lbl">Пользователь базы для выгрузки</label><input data-base-login="${id}" placeholder="Пользователь информационной базы" /><label class="lbl">Пароль пользователя базы</label><input type="password" data-base-secret="${id}" placeholder="Не администратор кластера" />`
+          : "";
+        return `<div class="stack"><select data-disk="${id}">${diskOptions}</select><input data-folder="${id}" placeholder="Папка в хранилище" />${baseUser}<label><input type="checkbox" data-sched="${id}" checked> По расписанию</label><div>${dayButtons}</div><input data-time="${id}" type="time" value="02:00" /><input data-keep="${id}" type="number" min="0" value="14" />${cloud}<button class="primary" type="button" data-add="${kind}" data-target="${id}">Добавить бекап</button></div>`;
       };
       $("host-list").innerHTML = (state.hosts || []).map((item) => {
         const options = (item.catalog || []).map((name) => `<option>${name}</option>`).join("");
@@ -1101,6 +1107,8 @@
         const time = document.querySelector(`[data-time="${target}"]`);
         const pickedDays = [...document.querySelectorAll(`[data-day-for="${target}"]`)].filter((item) => item.dataset.on === "1").map((item) => Number(item.dataset.day));
         const copyIds = [...document.querySelectorAll(`[data-cloud-for="${target}"]`)].filter((item) => item.checked).map((item) => item.value);
+        const baseLogin = document.querySelector(`[data-base-login="${target}"]`);
+        const baseSecret = document.querySelector(`[data-base-secret="${target}"]`);
         try {
           await send("/api/backup-jobs", {
             kind: add,
@@ -1109,10 +1117,30 @@
             folder: folder ? folder.value : "",
             cloudFolder: cloudFolder ? cloudFolder.value : "",
             copyIds,
+            baseLogin: baseLogin ? baseLogin.value : "",
+            baseSecret: baseSecret ? baseSecret.value : "",
             schedule: { enabled: Boolean(enabled && enabled.checked), days: pickedDays, time: time && time.value ? time.value : "02:00", keepDays: Number(keep && keep.value) || 14 }
           });
           await refresh();
         } catch { /* shown */ }
+        return;
+      }
+      const baseSave = event.target.closest("[data-base-save]");
+      if (baseSave) {
+        event.preventDefault();
+        const id = baseSave.dataset.baseSave;
+        const login = document.querySelector(`[data-base-login="${id}"]`);
+        const secret = document.querySelector(`[data-base-secret="${id}"]`);
+        try {
+          await send("/api/backup-jobs/user", {
+            id,
+            baseLogin: login ? login.value : "",
+            baseSecret: secret ? secret.value : ""
+          });
+          $("form-error").textContent = "Пользователь базы сохранён. Запустите бекап ещё раз.";
+        } catch (error) {
+          $("form-error").textContent = error.message;
+        }
         return;
       }
       const drop = event.target.closest("[data-drop]");

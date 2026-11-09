@@ -39,7 +39,7 @@ from hostadmin import (
 )
 from ops import deliver, list_storage, probe, public_copy, run_vm, schedule_due
 
-PRODUCT_VERSION = "1.2.23"
+PRODUCT_VERSION = "1.2.24"
 LOGIN_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
 
 STATE_DIR = Path(os.environ.get("ONEC_STATE_DIR", "/var/lib/onec-console"))
@@ -308,7 +308,10 @@ class Handler(BaseHTTPRequestHandler):
                     "chosenVms": state["chosenVms"],
                     "sqlServers": public_copy(state["sqlServers"]),
                     "chosenSql": state["chosenSql"],
-                    "backupJobs": state["backupJobs"],
+                    "backupJobs": [
+                        {key: value for key, value in item.items() if key != "baseSecret"}
+                        for item in state["backupJobs"]
+                    ],
                 },
             )
             return
@@ -428,6 +431,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/backup-jobs":
             self._add_backup_job()
+            return
+        if path == "/api/backup-jobs/user":
+            self._save_base_user()
             return
         if path == "/api/backup-jobs/run":
             self._run_backup_job()
@@ -1096,10 +1102,32 @@ class Handler(BaseHTTPRequestHandler):
                     "copyIds": payload.get("copyIds") or [],
                     "cloudFolder": clean_folder(payload.get("cloudFolder")),
                     "schedule": schedule,
+                    "baseLogin": str(payload.get("baseLogin", "")).strip(),
+                    "baseSecret": str(payload.get("baseSecret", "")),
                     "lastSlot": "",
                     "lastLog": [],
                 }
             )
+            save_state(state)
+        self._send(200, {"ok": True})
+
+    def _save_base_user(self) -> None:
+        payload = self._read_json()
+        login = str(payload.get("baseLogin", "")).strip()
+        secret = str(payload.get("baseSecret", ""))
+        with LOCK:
+            state = load_state()
+            found = False
+            for item in state["backupJobs"]:
+                if item["id"] != payload.get("id") or item.get("kind") != "base":
+                    continue
+                item["baseLogin"] = login
+                if secret:
+                    item["baseSecret"] = secret
+                found = True
+            if not found:
+                self._send(404, {"error": "Бекап базы не найден."})
+                return
             save_state(state)
         self._send(200, {"ok": True})
 
@@ -1270,11 +1298,9 @@ def perform_backup(state: dict, job: dict) -> list:
             else:
                 progress(15, "проверяю библиотеки клиента", "проверяю библиотеки клиента 1С")
                 progress(18, "проверяю библиотеки клиента", ensure_onec_runtime())
-                code, output = dump_config(binary, cluster, target, stamp, progress)
-                if output:
-                    progress(80, "конфигуратор завершился", output[-500:])
+                code, output = dump_config(binary, cluster, target, stamp, progress, job)
                 if code != 0:
-                    progress(100, "ошибка", "конфигуратор завершился с ошибкой")
+                    progress(100, "ошибка", output or "конфигуратор завершился с ошибкой")
                     return lines
                 progress(82, "конфигурация выгружена", f"бекап {target} → {stamp}")
     except Exception as error:
@@ -1300,14 +1326,47 @@ def perform_backup(state: dict, job: dict) -> list:
     return lines
 
 
-def dump_config(binary: str, cluster: dict, target: str, stamp: Path, progress) -> tuple:
+def designer_report(*paths: Path) -> str:
+    files = [path for path in paths if path.is_file()]
+    root = Path("/root/.1cv8")
+    now = time.time()
+    if root.is_dir():
+        for path in root.rglob("*"):
+            if not path.is_file():
+                continue
+            try:
+                info = path.stat()
+            except OSError:
+                continue
+            if now - info.st_mtime < 180 and info.st_size < 2_000_000:
+                files.append(path)
+    files.sort(key=lambda item: item.stat().st_mtime, reverse=True)
+    chunks = []
+    for path in files[:4]:
+        text = path.read_text(encoding="utf-8", errors="replace").strip()
+        if text:
+            chunks.append(text[-1000:])
+    return "\n".join(chunks).strip()[-1500:]
+
+
+def dump_config(binary: str, cluster: dict, target: str, stamp: Path, progress, job: dict) -> tuple:
+    if job.get("baseLogin"):
+        login = str(job.get("baseLogin") or "")
+        password = str(job.get("baseSecret") or "")
+    else:
+        login = str(cluster.get("login") or "")
+        password = str(cluster.get("secret") or "")
+        progress(20, "логин базы", "для выгрузки берётся логин кластера; нужен пользователь информационной базы")
     code = 1
     output = ""
     for _ in range(4):
-        progress(22, "запуск конфигуратора", f"запускаю конфигуратор для {target}")
+        progress(22, "запуск конфигуратора", f"запускаю конфигуратор для {target} под пользователем {login or 'без имени'}")
+        out_file = stamp / "designer-out.txt"
+        err_file = stamp / "designer-err.txt"
+        xvfb_file = stamp / "xvfb.err"
         command = [
-            binary, "DESIGNER", "/S", target, "/N", cluster.get("login", ""), "/P", cluster.get("secret", ""),
-            "/DisableStartupDialogs", "/DumpCfg", str(stamp / "config.cf"),
+            binary, "DESIGNER", "/S", target, "/N", login, "/P", password,
+            "/DisableStartupDialogs", "/Out", str(out_file), "/DumpCfg", str(stamp / "config.cf"),
         ]
         env = os.environ.copy()
         env.setdefault("HOME", "/root")
@@ -1316,22 +1375,10 @@ def dump_config(binary: str, cluster: dict, target: str, stamp: Path, progress) 
             if shutil.which("xvfb-run") is None:
                 apt_install(["xvfb"])
             if shutil.which("xvfb-run"):
-                command = ["xvfb-run", "-a", *command]
+                command = ["xvfb-run", "-a", "-e", str(xvfb_file), *command]
                 progress(22, "виртуальный экран", "экран не найден, запускаю через xvfb")
-        proc = subprocess.Popen(
-            command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            env=env,
-        )
-        captured = []
-
-        def drain() -> None:
-            captured.append(proc.stdout.read() if proc.stdout else "")
-
-        reader = threading.Thread(target=drain, daemon=True)
-        reader.start()
+        err_handle = err_file.open("w", encoding="utf-8")
+        proc = subprocess.Popen(command, stdout=err_handle, stderr=subprocess.STDOUT, text=True, env=env)
         started = time.time()
         last_note = 0
         while proc.poll() is None:
@@ -1349,11 +1396,15 @@ def dump_config(binary: str, cluster: dict, target: str, stamp: Path, progress) 
             progress(percent, phase, phase if elapsed - last_note >= 15 else "")
             if elapsed - last_note >= 15:
                 last_note = elapsed
-        reader.join(timeout=5)
-        output = (captured[0] if captured else "").strip()
+        err_handle.close()
+        output = designer_report(out_file, err_file, xvfb_file)
         code = proc.returncode if proc.returncode is not None else 1
-        if code == 0:
+        ready = (stamp / "config.cf").is_file() and (stamp / "config.cf").stat().st_size > 0
+        if code == 0 and ready:
             return code, output
+        if code == 0 and not ready:
+            code = 1
+            output = output or "конфигуратор закончил работу, но файл конфигурации пуст"
         missing = re.search(r"(\S+\.so(?:\.\d+)*): cannot open shared object file", output)
         if not missing:
             break
@@ -1361,7 +1412,7 @@ def dump_config(binary: str, cluster: dict, target: str, stamp: Path, progress) 
         progress(20, "ставлю библиотеку", note)
         if note.startswith("не ") or note.startswith("нет "):
             break
-    return code, output
+    return code, output or "конфигуратор завершился без текста ошибки"
 
 
 def tick() -> None:
