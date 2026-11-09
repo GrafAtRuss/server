@@ -67,7 +67,8 @@
     }
     .primary { background: var(--copper); color: var(--copper-ink); }
     .dark { background: var(--ink); color: var(--paper); }
-    .ghost { height: 40px; border: 1px solid var(--line); background: transparent; border-radius: 10px; padding: 0 12px; }
+    .meter { height: 8px; background: var(--line); border-radius: 99px; overflow: hidden; margin: 8px 0; }
+    .meter span { display: block; height: 100%; background: var(--pine); }
     .shell { min-height: 100vh; }
     @media (min-width: 960px) {
       .shell { display: grid; grid-template-columns: 240px 1fr; }
@@ -127,7 +128,7 @@
   <div id="boot" class="login"><p class="muted mono">Открываем консоль…</p></div>
   <form id="login" class="login hidden">
     <div class="card">
-      <p class="eyebrow">1.2.20</p>
+      <p class="eyebrow">1.2.21</p>
       <h1 style="margin-top:12px">Консоль платформы</h1>
       <label class="lbl" for="login-name">Логин</label>
       <input id="login-name" autocomplete="username" style="margin-top:8px" />
@@ -140,15 +141,15 @@
   <div id="app" class="shell hidden">
     <aside>
       <div>
-        <p class="eyebrow" style="color:var(--rail-dim)">1.2.20</p>
+        <p class="eyebrow" style="color:var(--rail-dim)">1.2.21</p>
         <p style="margin:4px 0 0;font-size:18px;font-weight:600">Консоль платформы</p>
       </div>
       <nav class="nav" style="overflow:auto">
         <button type="button" data-tab="platform" class="on">Установка</button>
         <button type="button" data-tab="bases">Базы</button>
         <button type="button" data-tab="sql">MSSQL</button>
-        <button type="button" data-tab="storages">Диски</button>
         <button type="button" data-tab="vms">Машины</button>
+        <button type="button" data-tab="storages">Хранилища</button>
         <button type="button" data-tab="system">Система</button>
         <button type="button" data-tab="service">Обслуживание</button>
         <button type="button" data-tab="about">Релиз</button>
@@ -198,7 +199,7 @@
       </section>
       <section id="tab-storages" class="hidden grid">
         <form id="disk-form" class="panel" data-role="disk">
-          <strong>Диски для хранения</strong>
+          <strong>Хранилища</strong>
           <p class="muted">Сюда пишутся бекапы и отсюда с ними работают.</p>
           <div class="stack">
             <select name="kind"><option value="webdav">WebDAV</option><option value="cifs">CIFS</option><option value="nfs">NFS</option><option value="ftp">FTP</option></select>
@@ -447,7 +448,13 @@
         const when = sched.enabled ? days.filter((_, index) => (sched.days || []).includes(index)).join(" ") + " " + (sched.time || "") : "вручную";
         const place = job.folder ? "папка " + esc(job.folder) : "папка по умолчанию";
         const cloud = (job.copyIds || []).length ? " · облако " + esc(job.cloudFolder || job.folder || "/") : "";
-        return `<p>${when} · ${place}${cloud} · хранить ${sched.keepDays ?? 14} дн. <button class="ghost" type="button" data-run="${job.id}">${job.running ? "Идёт…" : "Запустить"}</button> <button class="ghost" type="button" data-drop="backup-jobs:${job.id}">Удалить</button></p>${(job.lastLog || []).length ? `<pre class="log" style="min-height:0">${esc((job.lastLog || []).join("\n"))}</pre>` : ""}`;
+        const pct = Math.max(0, Math.min(100, Number(job.progress) || 0));
+        const shown = (job.lastLog || []).join("\n");
+        const active = job.running || shown || job.phase;
+        const details = active
+          ? `<div class="meter" data-job-bar="${job.id}"><span style="width:${pct}%"></span></div><p class="muted" data-job-phase="${job.id}">${pct}% · ${esc(job.phase || (job.running ? "запуск" : ""))}</p><pre class="log" data-job-log="${job.id}" style="min-height:0">${esc(shown)}</pre>`
+          : "";
+        return `<div${job.running ? ' data-live="1"' : ""}><p>${when} · ${place}${cloud} · хранить ${sched.keepDays ?? 14} дн. <button class="ghost" type="button" data-run="${job.id}">${job.running ? "Идёт…" : "Запустить"}</button> <button class="ghost" type="button" data-drop="backup-jobs:${job.id}">Удалить</button></p>${details}</div>`;
       };
       const jobForm = (id, kind) => {
         const dayButtons = days.map((label, index) => `<button class="ghost" type="button" data-day="${index}" data-day-for="${id}" data-on="${index < 5 ? "1" : "0"}" style="${index < 5 ? "background:var(--pine);color:#fff" : ""}">${label}</button>`).join("");
@@ -522,7 +529,7 @@
           platform: "Сервер, толстый и тонкий клиент ставятся одним запуском.",
           bases: "Сервер баз запоминается. Базу выбирают из списка. Бекапов может быть несколько.",
           sql: "Сервер MSSQL запоминается. Базу выбирают из списка. Файл .bak пишется на диск CIFS или на локальный SQL.",
-          storages: "Диски хранят бекапы. У каждого подключения можно открыть содержимое.",
+          storages: "Хранилища хранят бекапы. У каждого подключения можно открыть содержимое.",
           vms: "Гипервизор запоминается. Для ESXi логин root, для vCenter — administrator@vsphere.local. Пароль можно ввести заново у сервера.",
           system: "Имя хоста, пояс, адрес интерфейса, шлюз, DNS и правила фаервола.",
           service: "Перезагрузка, выключение и обновление с GitHub.",
@@ -875,14 +882,58 @@
     $("act-reboot").addEventListener("click", () => power("reboot"));
     $("act-off").addEventListener("click", () => power("poweroff"));
     $("act-update").addEventListener("click", async () => {
-      $("service-log").textContent = "Запускаю обновление…";
+      $("service-log").textContent = "Запускаю обновление…\n";
       try {
         const result = await send("/api/update", {});
-        $("service-log").textContent = result.detail;
+        $("service-log").textContent = result.detail + "\n";
+        await pullUpdateLog();
       } catch (error) {
         $("service-log").textContent = error.message;
       }
     });
+
+    async function pullUpdateLog() {
+      const data = await api("/api/update/log");
+      const box = $("service-log");
+      const text = data.text || "";
+      if (text && text !== box.textContent) {
+        box.textContent = text;
+        box.scrollTop = box.scrollHeight;
+      }
+      if (data.running) $("update-state").textContent = "Идёт обновление, журнал ниже обновляется сам.";
+      return data;
+    }
+
+    function paintJob(job) {
+      const box = document.querySelector(`[data-job-log="${job.id}"]`);
+      const text = (job.lastLog || []).join("\n");
+      if (box && box.textContent !== text) {
+        box.textContent = text;
+        box.scrollTop = box.scrollHeight;
+      }
+      const bar = document.querySelector(`[data-job-bar="${job.id}"] span`);
+      const pct = Math.max(0, Math.min(100, Number(job.progress) || 0));
+      if (bar) bar.style.width = pct + "%";
+      const phase = document.querySelector(`[data-job-phase="${job.id}"]`);
+      if (phase) phase.textContent = pct + "% · " + (job.phase || "");
+    }
+
+    setInterval(async () => {
+      if (!$("tab-service").classList.contains("hidden")) {
+        try { await pullUpdateLog(); } catch { /* журнал ещё пуст */ }
+      }
+      if (!document.querySelector("[data-live]")) return;
+      try {
+        const state = await api("/api/state");
+        let finished = false;
+        for (const job of state.backupJobs || []) {
+          paintJob(job);
+          const node = document.querySelector(`[data-job-log="${job.id}"]`);
+          if (node && node.closest("[data-live]") && !job.running) finished = true;
+        }
+        if (finished) await refresh();
+      } catch { /* сеть */ }
+    }, 1000);
 
     function renderMd(source) {
       const chunks = String(source || "").split("```");

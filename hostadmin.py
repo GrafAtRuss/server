@@ -492,7 +492,12 @@ def update_log_text() -> str:
     if not path.is_file():
         return ""
     lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
-    return "\n".join(lines[-40:])
+    return "\n".join(lines[-80:])
+
+
+def update_status() -> dict:
+    path = update_log_path()
+    return {"text": update_log_text(), "running": (path.parent / "update.running").is_file()}
 
 
 def schedule_update() -> str:
@@ -506,6 +511,10 @@ def schedule_update() -> str:
         f"""#!/bin/bash
 set -eu
 export HOME=/root
+mark={log_path.parent}/update.running
+echo $$ > "$mark"
+cleanup() {{ rm -f "$mark"; }}
+trap cleanup EXIT
 exec >> {log_path} 2>&1
 echo "--- $(date -Is) ---"
 git config --global --add safe.directory {SRC} || true

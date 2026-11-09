@@ -344,46 +344,52 @@ def entry(name: str, is_dir: bool, size, modified: str, rel: str) -> dict:
     return {"name": name, "kind": "dir" if is_dir else "file", "size": number, "modified": modified or "", "path": next_path}
 
 
-def run_vm(job: dict, host: dict, storage: dict) -> list:
-    if os.environ.get("ONEC_VM") == "skip":
-        return [
-            f"мягкое выключение {job['vmName']}",
-            "гость выключен",
-            f"бекап на {storage['name']}",
-            "включение",
-        ]
+def run_vm(job: dict, host: dict, storage: dict, step=None) -> list:
     log = []
+
+    def note(percent: int, phase: str, line: str) -> None:
+        log.append(line)
+        if step:
+            step(percent, phase, line)
+
+    if os.environ.get("ONEC_VM") == "skip":
+        note(30, "выключение", f"мягкое выключение {job['vmName']}")
+        note(50, "выключена", "гость выключен")
+        note(70, "копирование", f"бекап на {storage['name']}")
+        note(90, "включение", "включение")
+        return log
     turned_off = False
     control = None
     try:
+        note(20, "подключение к гипервизору", f"подключение к {host.get('host', '')}")
         control = connect_host(host)
-        log.append(f"мягкое выключение {job['vmName']}")
+        note(30, "мягкое выключение", f"мягкое выключение {job['vmName']}")
         control.shutdown(job["vmName"])
         if not control.wait_off(job["vmName"]):
-            log.append("машина не выключилась за 3 минуты, бекап отменён")
+            note(100, "ошибка", "машина не выключилась за 3 минуты, бекап отменён")
             return log
         turned_off = True
-        log.append("машина выключена")
+        note(55, "машина выключена", "машина выключена")
         stamp_dir = Path(job["stampDir"]) if job.get("stampDir") else None
         if stamp_dir is None:
             folder = MOUNT_ROOT / storage["id"] / "vms" / safe_name(job["vmName"])
             stamp_dir = folder / datetime.now().strftime("%Y%m%d-%H%M%S")
             stamp_dir.mkdir(parents=True, exist_ok=True)
         stamp_dir.mkdir(parents=True, exist_ok=True)
-        note = stamp_dir / "backup.txt"
-        note.write_text(f"{job['vmName']} off, host {host['host']}\n", encoding="utf-8")
-        log.append(f"отметка бекапа {note}")
+        note_path = stamp_dir / "backup.txt"
+        note_path.write_text(f"{job['vmName']} off, host {host['host']}\n", encoding="utf-8")
+        note(65, "копирование файлов", f"отметка бекапа {note_path}")
         copied = copy_vm_files(host, job["vmName"], stamp_dir)
-        log.append(copied)
+        note(80, "копирование файлов", copied)
     except Exception as error:
-        log.append(str(error))
+        note(100, "ошибка", str(error))
     finally:
         if turned_off and control:
             try:
                 control.power_on(job["vmName"])
-                log.append(f"включение {job['vmName']}")
+                note(90, "включение", f"включение {job['vmName']}")
             except Exception as error:
-                log.append(f"не удалось включить: {error}")
+                note(90, "ошибка включения", f"не удалось включить: {error}")
     return log
 
 

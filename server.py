@@ -31,13 +31,14 @@ from hostadmin import (
     sql_backup,
     sql_catalog,
     update_offer,
+    update_status,
     vm_catalog,
     ensure_onec_runtime,
     ensure_soname,
 )
 from ops import deliver, list_storage, probe, public_copy, run_vm, schedule_due
 
-PRODUCT_VERSION = "1.2.20"
+PRODUCT_VERSION = "1.2.21"
 LOGIN_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
 
 STATE_DIR = Path(os.environ.get("ONEC_STATE_DIR", "/var/lib/onec-console"))
@@ -325,6 +326,12 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, list_storage(item, rel))
             except Exception as error:
                 self._send(400, {"error": str(error)})
+            return
+        if path == "/api/update/log":
+            user = self._guard(state)
+            if not user:
+                return
+            self._send(200, update_status())
             return
         if path in ("/api/system", "/api/release", "/api/changelog", "/api/update"):
             user = self._guard(state)
@@ -1093,17 +1100,45 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 log = perform_backup(state, job)
             except Exception as error:
-                log = [str(error)]
+                log = [stamp_line(str(error))]
+                push_progress(job["id"], 100, "ошибка", str(error))
             with LOCK:
                 done = load_state()
                 for item in done["backupJobs"]:
                     if item["id"] == job["id"]:
                         item["running"] = False
+                        item["progress"] = 100
+                        item["phase"] = item.get("phase") or "готово"
                         item["lastLog"] = log
                 save_state(done)
 
         threading.Thread(target=work, daemon=True).start()
         self._send(200, {"log": ["запущено"]})
+
+
+def stamp_line(text: str) -> str:
+    from datetime import datetime
+
+    return datetime.now().strftime("%H:%M:%S") + " · " + text
+
+
+def push_progress(job_id: str, percent: int, phase: str, line: str = "") -> None:
+    if not job_id:
+        return
+    with LOCK:
+        state = load_state()
+        for item in state.get("backupJobs", []):
+            if item["id"] != job_id:
+                continue
+            item["progress"] = max(0, min(int(percent), 100))
+            item["phase"] = phase
+            item["running"] = item["progress"] < 100
+            if line:
+                log = item.setdefault("lastLog", [])
+                log.append(stamp_line(line))
+                if len(log) > 80:
+                    del log[:-80]
+        save_state(state)
 
 
 def read_schedule(value) -> dict:
@@ -1137,81 +1172,159 @@ def clean_folder(value) -> str:
 
 def perform_backup(state: dict, job: dict) -> list:
     storage = next((item for item in state["storages"] if item["id"] == job["storageId"]), None)
+    lines = []
+    job_id = job.get("id", "")
+
+    def progress(percent: int, phase: str, line: str = "") -> None:
+        if line:
+            lines.append(stamp_line(line))
+        push_progress(job_id, percent, phase, line)
+
     if not storage:
-        return ["диск бекапа не найден"]
+        progress(100, "ошибка", "диск бекапа не найден")
+        return lines
     keep = int((job.get("schedule") or {}).get("keepDays") or 0)
     folder = job.get("folder") or ""
+    progress(5, "подготовка", "запуск резервного копирования")
     try:
         if job["kind"] == "vm":
             chosen = next((item for item in state["chosenVms"] if item["id"] == job["targetId"]), None)
             host = next((item for item in state["hosts"] if chosen and item["id"] == chosen["sourceId"]), None)
             if not chosen or not host:
-                return ["машина или гипервизор не найдены"]
+                progress(100, "ошибка", "машина или гипервизор не найдены")
+                return lines
+            progress(10, "создаю папку", "создаю папку бекапа")
             stamp, parent = open_backup(storage, folder, "vms", chosen["name"])
+            progress(15, "папка готова", f"папка создана: {parent}")
             vm_job = {**job, "vmName": chosen["name"], "stampDir": str(stamp)}
-            log = [f"папка создана: {parent}"]
-            log.extend(run_vm(vm_job, host, storage) or [])
+
+            def vm_step(percent: int, phase: str, line: str) -> None:
+                progress(percent, phase, line)
+
+            run_vm(vm_job, host, storage, vm_step)
         elif job["kind"] == "sql":
             chosen = next((item for item in state["chosenSql"] if item["id"] == job["targetId"]), None)
             sql_server = next((item for item in state["sqlServers"] if chosen and item["id"] == chosen["sourceId"]), None)
             if not chosen or not sql_server:
-                return ["база или сервер SQL не найдены"]
+                progress(100, "ошибка", "база или сервер SQL не найдены")
+                return lines
+            progress(10, "создаю папку", "создаю папку бекапа")
             stamp, parent = open_backup(storage, folder, "sql", chosen["name"])
-            log = [f"папка создана: {parent}", sql_backup(sql_server, chosen["name"], storage, stamp)]
+            progress(20, "папка готова", f"папка создана: {parent}")
+            progress(30, "SQL Server пишет копию", f"запускаю BACKUP DATABASE {chosen['name']}")
+            stop = threading.Event()
+
+            def beat() -> None:
+                percent = 32
+                while not stop.wait(3):
+                    percent = min(percent + 3, 82)
+                    push_progress(job_id, percent, "SQL Server пишет резервную копию")
+
+            threading.Thread(target=beat, daemon=True).start()
+            try:
+                written = sql_backup(sql_server, chosen["name"], storage, stamp)
+            finally:
+                stop.set()
+            progress(88, "файл записан", written)
         else:
             chosen = next((item for item in state["chosenBases"] if item["id"] == job["targetId"]), None)
             cluster = next((item for item in state["clusters"] if chosen and item["id"] == chosen["sourceId"]), None)
             if not chosen or not cluster:
-                return ["база или кластер не найдены"]
+                progress(100, "ошибка", "база или кластер не найдены")
+                return lines
+            progress(8, "создаю папку", "создаю папку бекапа")
             stamp, parent = open_backup(storage, folder, "bases", chosen["name"])
             target = f"{cluster['host']}\\{chosen['name']}"
+            progress(12, "папка готова", f"папка создана: {parent}")
             installed = state.get("installed") or {}
             binary = installed.get("binary")
             if os.environ.get("ONEC_PROBE") == "skip" or not binary:
                 (stamp / "config.cf").write_text(f"dump {target}\n", encoding="utf-8")
-                log = [f"папка создана: {parent}", f"бекап {target} → {stamp}"]
+                progress(80, "выгрузка записана", f"бекап {target} → {stamp}")
             else:
-                notes = [ensure_onec_runtime()]
-                output = ""
-                code = 1
-                for _ in range(4):
-                    result = subprocess.run(
-                        [
-                            binary, "DESIGNER", "/S", target, "/N", cluster.get("login", ""), "/P", cluster.get("secret", ""),
-                            "/DisableStartupDialogs", "/DumpCfg", str(stamp / "config.cf"),
-                        ],
-                        text=True, capture_output=True, check=False, timeout=3600,
-                    )
-                    output = (result.stdout or result.stderr or "").strip()
-                    code = result.returncode
-                    if code == 0:
-                        break
-                    missing = re.search(r"(\S+\.so(?:\.\d+)*): cannot open shared object file", output)
-                    if not missing:
-                        break
-                    installed_note = ensure_soname(missing.group(1))
-                    notes.append(installed_note)
-                    if installed_note.startswith("не ") or installed_note.startswith("нет "):
-                        break
-                log = [f"папка создана: {parent}", f"бекап {target} → {stamp}", *notes, output]
+                progress(15, "проверяю библиотеки клиента", "проверяю библиотеки клиента 1С")
+                progress(18, "проверяю библиотеки клиента", ensure_onec_runtime())
+                code, output = dump_config(binary, cluster, target, stamp, progress)
+                if output:
+                    progress(80, "конфигуратор завершился", output[-500:])
                 if code != 0:
-                    log.append("Конфигуратор завершился с ошибкой")
-                    return log
+                    progress(100, "ошибка", "конфигуратор завершился с ошибкой")
+                    return lines
+                progress(82, "конфигурация выгружена", f"бекап {target} → {stamp}")
     except Exception as error:
-        return [str(error)]
+        progress(100, "ошибка", str(error))
+        return lines
     if stamp.is_dir() and any(stamp.iterdir()):
+        progress(86, "сохраняю в хранилище", "переношу файлы в хранилище")
         if storage.get("kind") not in ("cifs", "nfs"):
-            log.append(deliver(storage, folder, stamp))
+            progress(90, "сохраняю в хранилище", deliver(storage, folder, stamp))
         else:
-            log.append(f"папка {stamp}")
-        for cloud_id in job.get("copyIds") or []:
+            progress(90, "файлы на диске", f"папка {stamp}")
+        copies = job.get("copyIds") or []
+        for index, cloud_id in enumerate(copies):
             cloud = next((item for item in state["storages"] if item["id"] == cloud_id and item.get("role") == "cloud"), None)
             if cloud:
-                log.append(deliver(cloud, job.get("cloudFolder") or folder, stamp))
+                progress(92 + index, f"копия в {cloud.get('name', 'облако')}", f"копирую в {cloud.get('name', 'облако')}")
+                progress(93 + index, f"копия в {cloud.get('name', 'облако')}", deliver(cloud, job.get("cloudFolder") or folder, stamp))
+    progress(96, "проверяю срок хранения", "удаляю копии старше срока")
     removed = prune(parent, keep)
     if removed:
-        log.append("удалено старше срока: " + ", ".join(removed))
-    return log
+        progress(98, "старые копии удалены", "удалено старше срока: " + ", ".join(removed))
+    progress(100, "готово", "резервное копирование завершено")
+    return lines
+
+
+def dump_config(binary: str, cluster: dict, target: str, stamp: Path, progress) -> tuple:
+    code = 1
+    output = ""
+    for _ in range(4):
+        progress(22, "запуск конфигуратора", f"запускаю конфигуратор для {target}")
+        proc = subprocess.Popen(
+            [
+                binary, "DESIGNER", "/S", target, "/N", cluster.get("login", ""), "/P", cluster.get("secret", ""),
+                "/DisableStartupDialogs", "/DumpCfg", str(stamp / "config.cf"),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        captured = []
+
+        def drain() -> None:
+            captured.append(proc.stdout.read() if proc.stdout else "")
+
+        reader = threading.Thread(target=drain, daemon=True)
+        reader.start()
+        started = time.time()
+        last_note = 0
+        while proc.poll() is None:
+            time.sleep(2)
+            elapsed = int(time.time() - started)
+            size = (stamp / "config.cf").stat().st_size if (stamp / "config.cf").exists() else 0
+            percent = min(78, 25 + elapsed // 4)
+            if size >= 1048576:
+                amount = f"{size // 1048576} МБ"
+            elif size:
+                amount = f"{max(size // 1024, 1)} КБ"
+            else:
+                amount = "файл ещё пуст"
+            phase = f"конфигуратор выгружает конфигурацию, {elapsed} с, {amount}"
+            progress(percent, phase, phase if elapsed - last_note >= 15 else "")
+            if elapsed - last_note >= 15:
+                last_note = elapsed
+        reader.join(timeout=5)
+        output = (captured[0] if captured else "").strip()
+        code = proc.returncode if proc.returncode is not None else 1
+        if code == 0:
+            return code, output
+        missing = re.search(r"(\S+\.so(?:\.\d+)*): cannot open shared object file", output)
+        if not missing:
+            break
+        note = ensure_soname(missing.group(1))
+        progress(20, "ставлю библиотеку", note)
+        if note.startswith("не ") or note.startswith("нет "):
+            break
+    return code, output
 
 
 def tick() -> None:
@@ -1232,10 +1345,15 @@ def tick() -> None:
         job["lastSlot"] = now.strftime("%Y-%m-%dT%H:%M")
         changed = True
     for job in state.get("backupJobs", []):
+        if job.get("running"):
+            continue
         if not schedule_due(job.get("schedule") or {}, now, job.get("lastSlot", "")):
             continue
+        job["running"] = True
         job["lastLog"] = perform_backup(state, job)
         job["lastSlot"] = now.strftime("%Y-%m-%dT%H:%M")
+        job["running"] = False
+        job["progress"] = 100
         changed = True
     if changed:
         with LOCK:
@@ -1246,6 +1364,8 @@ def tick() -> None:
                 if item["id"] in slots:
                     item["lastSlot"] = slots[item["id"]]
                     item["lastLog"] = logs[item["id"]]
+                    item["running"] = False
+                    item["progress"] = 100
             fresh["jobs"] = state["jobs"]
             save_state(fresh)
 
