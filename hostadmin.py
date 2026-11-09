@@ -795,6 +795,16 @@ def sql_address(server: dict) -> str:
     return f"{host},{server.get('port') or 1433}"
 
 
+def sql_error_text(error: Exception) -> str:
+    parts = []
+    for item in getattr(error, "args", ()) or (str(error),):
+        if isinstance(item, bytes):
+            parts.append(item.decode("utf-8", errors="replace"))
+        else:
+            parts.append(str(item))
+    return " ".join(parts).replace("\n", " ").strip()
+
+
 def sql_exec(server: dict, query: str, timeout: int = 60) -> str:
     pymssql_error = ""
     if os.environ.get("ONEC_SQL") != "sqlcmd":
@@ -811,22 +821,40 @@ def sql_exec(server: dict, query: str, timeout: int = 60) -> str:
                 "password": str(server.get("secret", "")),
                 "login_timeout": 20,
                 "timeout": timeout,
+                "autocommit": True,
             }
             for tds in (None, "7.3", "7.2"):
+                attempt = dict(kwargs)
+                if tds:
+                    attempt["tds_version"] = tds
                 try:
-                    connection = pymssql.connect(**kwargs, **({"tds_version": tds} if tds else {}))
+                    connection = pymssql.connect(**attempt)
+                except TypeError:
+                    attempt.pop("autocommit", None)
+                    connection = pymssql.connect(**attempt)
+                    if hasattr(connection, "autocommit"):
+                        connection.autocommit(True)
                 except Exception as error:
-                    pymssql_error = str(error)
+                    pymssql_error = sql_error_text(error)
                     if "unrecognized tds version" in pymssql_error:
                         continue
                     break
                 try:
+                    try:
+                        if hasattr(connection, "autocommit"):
+                            connection.autocommit(True)
+                    except Exception:
+                        pass
                     cursor = connection.cursor()
                     cursor.execute(query)
                     if cursor.description:
                         return "\n".join("" if row[0] is None else str(row[0]) for row in cursor.fetchall())
-                    connection.commit()
                     return ""
+                except Exception as error:
+                    pymssql_error = sql_error_text(error)
+                    if "unrecognized tds version" in pymssql_error:
+                        continue
+                    break
                 finally:
                     connection.close()
     try:
@@ -1009,6 +1037,7 @@ def pull_bak_sql(server: dict, remote: str, local: Path) -> None:
         password=str(server.get("secret", "")),
         login_timeout=20,
         timeout=7200,
+        autocommit=True,
     )
     try:
         cursor = connection.cursor()

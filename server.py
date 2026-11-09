@@ -39,7 +39,7 @@ from hostadmin import (
 )
 from ops import deliver, list_storage, probe, public_copy, run_vm, schedule_due
 
-PRODUCT_VERSION = "1.2.24"
+PRODUCT_VERSION = "1.2.25"
 LOGIN_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
 
 STATE_DIR = Path(os.environ.get("ONEC_STATE_DIR", "/var/lib/onec-console"))
@@ -1326,6 +1326,25 @@ def perform_backup(state: dict, job: dict) -> list:
     return lines
 
 
+def pin_host(name: str, ip: str) -> bool:
+    if not re.fullmatch(r"[A-Za-z0-9._-]{1,253}", name):
+        return False
+    if not re.fullmatch(r"\d{1,3}(?:\.\d{1,3}){3}", ip):
+        return False
+    path = Path("/etc/hosts")
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    if re.search(rf"(?m)^\s*{re.escape(ip)}\s+\S.*\b{re.escape(name)}\b", text):
+        return False
+    with path.open("a", encoding="utf-8") as handle:
+        if text and not text.endswith("\n"):
+            handle.write("\n")
+        handle.write(f"{ip}\t{name}\n")
+    return True
+
+
 def designer_report(*paths: Path) -> str:
     files = [path for path in paths if path.is_file()]
     root = Path("/root/.1cv8")
@@ -1346,7 +1365,18 @@ def designer_report(*paths: Path) -> str:
         text = path.read_text(encoding="utf-8", errors="replace").strip()
         if text:
             chunks.append(text[-1000:])
-    return "\n".join(chunks).strip()[-1500:]
+    cleaned = []
+    for line in "\n".join(chunks).splitlines():
+        if "keysym XF86" in line or "xkbcomp" in line or line.strip().startswith(">"):
+            continue
+        cleaned.append(line)
+    text = "\n".join(cleaned).strip()
+    important = [
+        line for line in text.splitlines()
+        if re.search(r"Ошибк|server_addr|name resolution|error|не удал", line, re.I)
+    ]
+    tail = text.splitlines()[-6:]
+    return "\n".join(important + tail).strip()[-1500:]
 
 
 def dump_config(binary: str, cluster: dict, target: str, stamp: Path, progress, job: dict) -> tuple:
@@ -1406,12 +1436,18 @@ def dump_config(binary: str, cluster: dict, target: str, stamp: Path, progress, 
             code = 1
             output = output or "конфигуратор закончил работу, но файл конфигурации пуст"
         missing = re.search(r"(\S+\.so(?:\.\d+)*): cannot open shared object file", output)
-        if not missing:
-            break
-        note = ensure_soname(missing.group(1))
-        progress(20, "ставлю библиотеку", note)
-        if note.startswith("не ") or note.startswith("нет "):
-            break
+        if missing:
+            note = ensure_soname(missing.group(1))
+            progress(20, "ставлю библиотеку", note)
+            if note.startswith("не ") or note.startswith("нет "):
+                break
+            continue
+        addr = re.search(r"server_addr=([A-Za-z0-9._-]+)", output)
+        ip = target.split("\\", 1)[0].strip()
+        if addr and pin_host(addr.group(1), ip):
+            progress(24, "имя сервера", f"{addr.group(1)} не резолвится, записал {ip} {addr.group(1)} и повторяю")
+            continue
+        break
     return code, output or "конфигуратор завершился без текста ошибки"
 
 
