@@ -712,16 +712,22 @@ def sql_exec(server: dict, query: str, timeout: int = 60) -> str:
             pymssql = None
         if pymssql is not None:
             host = str(server.get("host", "")).strip()
-            try:
-                connection = pymssql.connect(
-                    server=host,
-                    port=int(server.get("port") or 1433),
-                    user=str(server.get("login", "")),
-                    password=str(server.get("secret", "")),
-                    login_timeout=20,
-                    timeout=timeout,
-                    tds_version="7.4",
-                )
+            kwargs = {
+                "server": host,
+                "port": int(server.get("port") or 1433),
+                "user": str(server.get("login", "")),
+                "password": str(server.get("secret", "")),
+                "login_timeout": 20,
+                "timeout": timeout,
+            }
+            for tds in (None, "7.3", "7.2"):
+                try:
+                    connection = pymssql.connect(**kwargs, **({"tds_version": tds} if tds else {}))
+                except Exception as error:
+                    pymssql_error = str(error)
+                    if "unrecognized tds version" in pymssql_error:
+                        continue
+                    break
                 try:
                     cursor = connection.cursor()
                     cursor.execute(query)
@@ -731,8 +737,6 @@ def sql_exec(server: dict, query: str, timeout: int = 60) -> str:
                     return ""
                 finally:
                     connection.close()
-            except Exception as error:
-                pymssql_error = str(error)
     try:
         binary = sqlcmd_path()
     except RuntimeError as error:
