@@ -19,6 +19,44 @@ RAW = "https://raw.githubusercontent.com/GrafAtRuss/server/main"
 WEB = "https://github.com/GrafAtRuss/server"
 
 
+SONAME_PACKAGES = {
+    "libcups.so.2": ("libcups2t64", "libcups2"),
+    "libgtk-3.so.0": ("libgtk-3-0t64", "libgtk-3-0"),
+    "libgdk-3.so.0": ("libgtk-3-0t64", "libgtk-3-0"),
+    "libfontconfig.so.1": ("libfontconfig1",),
+    "libgsf-1.so.114": ("libgsf-1-114",),
+    "libenchant-2.so.2": ("libenchant-2-2",),
+    "libxslt.so.1": ("libxslt1.1",),
+    "libwebkit2gtk-4.1.so.0": ("libwebkit2gtk-4.1-0",),
+    "libwebkit2gtk-4.0.so.37": ("libwebkit2gtk-4.0-37",),
+}
+
+
+def ensure_soname(soname: str) -> str:
+    packages = SONAME_PACKAGES.get(soname)
+    if not packages:
+        return f"нет пакета для {soname}"
+    if os.environ.get("ONEC_PROBE") == "skip":
+        return f"пакет для {soname} отложен"
+    env = os.environ.copy()
+    env["DEBIAN_FRONTEND"] = "noninteractive"
+    error = ""
+    for package in packages:
+        result = subprocess.run(
+            ["apt-get", "install", "-y", package],
+            text=True,
+            capture_output=True,
+            check=False,
+            env=env,
+            timeout=300,
+        )
+        if result.returncode == 0:
+            return f"установлен {package}"
+        text = (result.stderr or result.stdout or "").strip().splitlines()
+        error = text[-1] if text else package
+    return f"не установлен {soname}: {error}"
+
+
 def command(args: list, timeout: int = 20) -> tuple[int, str]:
     try:
         result = subprocess.run(args, text=True, capture_output=True, timeout=timeout, check=False)

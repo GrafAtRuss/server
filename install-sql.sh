@@ -17,6 +17,7 @@ while [ "$i" -lt 60 ]; do
 done
 export DEBIAN_FRONTEND=noninteractive
 apt-get update || true
+apt-get install -y libcups2t64 || apt-get install -y libcups2 || true
 if apt-get install -y python3-pymssql; then
   python3 -c 'import pymssql' >/dev/null 2>&1 && exit 0
 fi

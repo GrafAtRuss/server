@@ -32,10 +32,11 @@ from hostadmin import (
     sql_catalog,
     update_offer,
     vm_catalog,
+    ensure_soname,
 )
 from ops import deliver, list_storage, probe, public_copy, run_vm, schedule_due
 
-PRODUCT_VERSION = "1.2.16"
+PRODUCT_VERSION = "1.2.17"
 LOGIN_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
 
 STATE_DIR = Path(os.environ.get("ONEC_STATE_DIR", "/var/lib/onec-console"))
@@ -719,6 +720,7 @@ class Handler(BaseHTTPRequestHandler):
         apt = subprocess.run(["apt-get", "install", "-f", "-y"], text=True, capture_output=True, check=False)
         tail = (apt.stdout + apt.stderr).strip().splitlines()
         log.extend(tail[-8:])
+        log.append(ensure_soname("libcups.so.2"))
         binary = Path(f"/opt/1cv8/x86_64/{version}/1cv8")
         log.append(f"проверка  test -x {binary}")
         installed = None
@@ -1168,15 +1170,30 @@ def perform_backup(state: dict, job: dict) -> list:
                 (stamp / "config.cf").write_text(f"dump {target}\n", encoding="utf-8")
                 log = [f"папка создана: {parent}", f"бекап {target} → {stamp}"]
             else:
-                result = subprocess.run(
-                    [
-                        binary, "DESIGNER", "/S", target, "/N", cluster.get("login", ""), "/P", cluster.get("secret", ""),
-                        "/DisableStartupDialogs", "/DumpCfg", str(stamp / "config.cf"),
-                    ],
-                    text=True, capture_output=True, check=False, timeout=3600,
-                )
-                log = [f"папка создана: {parent}", f"бекап {target} → {stamp}", (result.stdout or result.stderr or "").strip()]
-                if result.returncode != 0:
+                notes = [ensure_soname("libcups.so.2")]
+                output = ""
+                code = 1
+                for _ in range(4):
+                    result = subprocess.run(
+                        [
+                            binary, "DESIGNER", "/S", target, "/N", cluster.get("login", ""), "/P", cluster.get("secret", ""),
+                            "/DisableStartupDialogs", "/DumpCfg", str(stamp / "config.cf"),
+                        ],
+                        text=True, capture_output=True, check=False, timeout=3600,
+                    )
+                    output = (result.stdout or result.stderr or "").strip()
+                    code = result.returncode
+                    if code == 0:
+                        break
+                    missing = re.search(r"(\S+\.so(?:\.\d+)*): cannot open shared object file", output)
+                    if not missing:
+                        break
+                    installed_note = ensure_soname(missing.group(1))
+                    notes.append(installed_note)
+                    if installed_note.startswith("не ") or installed_note.startswith("нет "):
+                        break
+                log = [f"папка создана: {parent}", f"бекап {target} → {stamp}", *notes, output]
+                if code != 0:
                     log.append("Конфигуратор завершился с ошибкой")
                     return log
     except Exception as error:
