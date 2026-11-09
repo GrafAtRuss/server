@@ -35,7 +35,7 @@ from hostadmin import (
 )
 from ops import deliver, list_storage, probe, public_copy, run_vm, schedule_due
 
-PRODUCT_VERSION = "1.2.14"
+PRODUCT_VERSION = "1.2.15"
 LOGIN_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
 
 STATE_DIR = Path(os.environ.get("ONEC_STATE_DIR", "/var/lib/onec-console"))
@@ -943,6 +943,15 @@ class Handler(BaseHTTPRequestHandler):
         if not host:
             self._send(404, {"error": "Гипервизор не найден."})
             return
+        supplied = str(payload.get("secret", "")).strip()
+        if supplied:
+            host["secret"] = supplied
+            with LOCK:
+                fresh = load_state()
+                for item in fresh["hosts"]:
+                    if item["id"] == host["id"]:
+                        item["secret"] = supplied
+                save_state(fresh)
         try:
             names = vm_catalog(host)
         except Exception as error:

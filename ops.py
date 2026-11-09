@@ -462,11 +462,11 @@ def http_exchange(url: str, method: str, headers: dict, body: bytes = b"", keep_
     raise RuntimeError("слишком много перенаправлений")
 
 
-def vsphere_login(base: str, login: str, secret: str) -> tuple[str, str]:
+def vsphere_login(base: str, login: str, secret: str, kind: str = "") -> tuple[str, str]:
     """Сессия vCenter 7 или ESXi. Пароль не теряется на переадресации."""
-    secret = str(secret or "").strip()
+    secret = str(secret or "").replace("\ufeff", "").strip()
     errors = []
-    for user in login_variants(login):
+    for user in login_variants(login, kind):
         session, curl_errors = curl_login(base, user, secret)
         errors.extend(curl_errors)
         if session:
@@ -513,36 +513,38 @@ def curl_login(base: str, login: str, secret: str):
     if not curl:
         return None, []
     errors = []
-    for path, root in (("/api/session", "/api"), ("/rest/com/vmware/cis/session", "/rest")):
-        result = subprocess.run(
-            [
-                curl, "-sk", "--path-as-is", "--max-time", "20",
-                "--location-trusted", "--post301", "--post302", "--post303",
-                "-u", f"{login}:{secret}",
-                "-H", "vmware-use-header-authn: true",
-                "-H", "Accept: application/json",
-                "-H", "Content-Type: application/json",
-                "-X", "POST", "--data", "{}",
-                "-w", "\n%{http_code}", base.rstrip("/") + path,
-            ],
-            capture_output=True, text=True, timeout=25, check=False,
-        )
-        lines = (result.stdout or "").splitlines()
-        code = lines[-1] if lines else ""
-        raw = "\n".join(lines[:-1]).strip()
-        if code != "200" or not raw:
-            errors.append(f"curl {root} {code or result.returncode}: {auth_detail(raw or result.stderr or '')}")
-            continue
-        session = json.loads(raw) if raw.startswith("{") else raw.strip('"')
-        if isinstance(session, dict):
-            session = session.get("value", "")
-        if session:
-            return (str(session), root), []
+    header_sets = (["-H", "vmware-use-header-authn: true"], [])
+    for extra in header_sets:
+        for path, root in (("/api/session", "/api"), ("/rest/com/vmware/cis/session", "/rest")):
+            result = subprocess.run(
+                [
+                    curl, "-sk", "--path-as-is", "--max-time", "20",
+                    "--location-trusted", "--post301", "--post302", "--post303",
+                    "-u", f"{login}:{secret}",
+                    *extra,
+                    "-H", "Accept: application/json",
+                    "-H", "Content-Type: application/json",
+                    "-X", "POST", "--data", "{}",
+                    "-w", "\n%{http_code}", base.rstrip("/") + path,
+                ],
+                capture_output=True, text=True, timeout=25, check=False,
+            )
+            lines = (result.stdout or "").splitlines()
+            code = lines[-1] if lines else ""
+            raw = "\n".join(lines[:-1]).strip()
+            if code != "200" or not raw:
+                errors.append(f"curl {root} {code or result.returncode}: {auth_detail(raw or result.stderr or '')}")
+                continue
+            session = json.loads(raw) if raw.startswith("{") else raw.strip('"')
+            if isinstance(session, dict):
+                session = session.get("value", "")
+            if session:
+                return (str(session), root), []
     return None, errors
 
 
-def login_variants(login: str) -> list:
-    login = str(login or "").strip()
+def login_variants(login: str, kind: str = "") -> list:
+    login = str(login or "").replace("\ufeff", "").strip()
     names = []
 
     def add(value: str) -> None:
@@ -554,10 +556,14 @@ def login_variants(login: str) -> list:
     if "\\" in login:
         domain, user = login.split("\\", 1)
         add(f"{user}@{domain}")
+        add(f"{user}@{domain.lower()}")
         add(user)
     elif "@" in login:
-        add(login.split("@", 1)[0])
-    else:
+        user, domain = login.split("@", 1)
+        add(f"{user}@{domain.lower()}")
+        if kind != "esxi":
+            add(user)
+    elif kind != "esxi":
         add(f"{login}@vsphere.local")
         add(f"vsphere.local\\{login}")
     return names or [login]
@@ -574,16 +580,23 @@ def list_vm_names(host: dict) -> list:
 def connect_host(host: dict):
     base = api_base(host["host"])
     rest_error = ""
+    kind = host.get("kind") or ""
     try:
-        session, root = vsphere_login(base, host["login"], host["secret"])
+        session, root = vsphere_login(base, host.get("login", ""), host.get("secret", ""), kind)
         return RestHost(base, root, session)
     except RuntimeError as error:
         rest_error = str(error)
     try:
-        return SoapHost.login(base, host["login"], host["secret"])
+        return SoapHost.login(base, host.get("login", ""), host.get("secret", ""), kind)
     except RuntimeError as error:
-        secret = str(host.get("secret", ""))
-        hint = f" Логин «{host.get('login', '')}», длина пароля {len(secret)}."
+        secret = str(host.get("secret", "")).strip()
+        kind = host.get("kind") or ""
+        where = "vCenter" if kind == "vsphere" else "ESXi"
+        hint = (
+            f" Логин «{str(host.get('login', '')).strip()}», длина пароля {len(secret)}. "
+            f"Для {where} "
+            + ("нужен administrator@vsphere.local, не root." if kind == "vsphere" else "обычно логин root.")
+        )
         raise RuntimeError(f"{rest_error}. {error}.{hint}") from error
 
 
@@ -622,7 +635,7 @@ class SoapHost:
         self.morefs = {}
 
     @classmethod
-    def login(cls, base: str, login: str, secret: str):
+    def login(cls, base: str, login: str, secret: str, kind: str = ""):
         content = ""
         action = ""
         errors = []
@@ -653,31 +666,35 @@ class SoapHost:
         session_manager = soap_value(content, "sessionManager")
         if not collector or not session_manager:
             raise RuntimeError("ESXi SOAP не отдал службу входа")
+        secret = str(secret or "").replace("\ufeff", "").strip()
         cookie = ""
         login_error = ""
-        styles = [chosen] if chosen else []
-        for extra in ("prefixed", "plain"):
-            if extra not in styles:
-                styles.append(extra)
-        for style in styles:
-            for user in login_variants(login):
-                body = (
-                    "<urn:Login>"
-                    f"<urn:_this type=\"SessionManager\">{xml_escape(session_manager)}</urn:_this>"
-                    f"<urn:userName>{xml_escape(user)}</urn:userName>"
-                    f"<urn:password><![CDATA[{secret.replace(']]>', ']]]]><![CDATA[>')}]]></urn:password>"
-                    "</urn:Login>"
-                )
-                try:
-                    _, cookie = soap_call(base, body, action=action, style=style)
-                except RuntimeError as error:
-                    login_error = f"{user}: {error}"
-                    continue
-                if "vmware_soap_session" in cookie:
-                    host = cls(base, cookie, collector, view_manager, root_folder, action)
-                    host.style = style
-                    return host
-                login_error = f"{user}: ESXi SOAP не открыл сессию"
+        morefs = []
+        for candidate in (session_manager, "ha-sessionmgr", "SessionManager"):
+            if candidate and candidate not in morefs:
+                morefs.append(candidate)
+        users = login_variants(login, kind)
+        for style in ("plain", "prefixed"):
+            for moref in morefs:
+                for user in users:
+                    password = xml_escape(secret)
+                    body = (
+                        "<urn:Login>"
+                        f"<urn:_this type=\"SessionManager\">{xml_escape(moref)}</urn:_this>"
+                        f"<urn:userName>{xml_escape(user)}</urn:userName>"
+                        f"<urn:password>{password}</urn:password>"
+                        "</urn:Login>"
+                    )
+                    try:
+                        _, cookie = soap_call(base, body, action=action, style=style)
+                    except RuntimeError as error:
+                        login_error = f"{user} / {moref}: {error}"
+                        continue
+                    if "vmware_soap_session" in cookie.lower():
+                        host = cls(base, cookie, collector, view_manager, root_folder, action)
+                        host.style = style
+                        return host
+                    login_error = f"{user} / {moref}: сессия не выдана"
         raise RuntimeError(login_error or "ESXi SOAP не открыл сессию")
 
     def names(self) -> list:

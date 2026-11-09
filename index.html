@@ -127,7 +127,7 @@
   <div id="boot" class="login"><p class="muted mono">Открываем консоль…</p></div>
   <form id="login" class="login hidden">
     <div class="card">
-      <p class="eyebrow">1.2.14</p>
+      <p class="eyebrow">1.2.15</p>
       <h1 style="margin-top:12px">Консоль платформы</h1>
       <label class="lbl" for="login-name">Логин</label>
       <input id="login-name" autocomplete="username" style="margin-top:8px" />
@@ -140,7 +140,7 @@
   <div id="app" class="shell hidden">
     <aside>
       <div>
-        <p class="eyebrow" style="color:var(--rail-dim)">1.2.14</p>
+        <p class="eyebrow" style="color:var(--rail-dim)">1.2.15</p>
         <p style="margin:4px 0 0;font-size:18px;font-weight:600">Консоль платформы</p>
       </div>
       <nav class="nav" style="overflow:auto">
@@ -459,7 +459,7 @@
       $("host-list").innerHTML = (state.hosts || []).map((item) => {
         const options = (item.catalog || []).map((name) => `<option>${name}</option>`).join("");
         const chosen = (state.chosenVms || []).filter((vm) => vm.sourceId === item.id).map((vm) => `<div style="margin-top:12px"><b>${esc(vm.name)}</b> <button class="ghost" type="button" data-drop="chosen:${vm.id}" data-kind="vm">Убрать</button>${jobsOf("vm", vm.id).map(jobHtml).join("")}${jobForm(vm.id, "vm")}</div>`).join("");
-        return `${row(item, "hosts")}<div class="stack"><button class="ghost" type="button" data-catalog="hosts" data-id="${item.id}">Обновить список</button><select data-pick="${item.id}">${options}</select><button class="dark" type="button" data-take="vm" data-source="${item.id}">Взять в работу</button></div>${chosen}`;
+        return `${row(item, "hosts")}<div class="stack"><input type="password" data-secret="${item.id}" placeholder="Пароль заново, если список не открылся" /><button class="ghost" type="button" data-catalog="hosts" data-id="${item.id}">Обновить список</button><select data-pick="${item.id}">${options}</select><button class="dark" type="button" data-take="vm" data-source="${item.id}">Взять в работу</button></div>${chosen}`;
       }).join("") || "<p class='muted'>Гипервизоры не подключены.</p>";
       $("cluster-list").innerHTML = (state.clusters || []).map((item) => {
         const options = (item.catalog || []).map((name) => `<option>${name}</option>`).join("");
@@ -523,7 +523,7 @@
           bases: "Сервер баз запоминается. Базу выбирают из списка. Бекапов может быть несколько.",
           sql: "Сервер MSSQL запоминается. Базу выбирают из списка. Файл .bak пишется на диск CIFS или на локальный SQL.",
           storages: "Диски хранят бекапы. У каждого подключения можно открыть содержимое.",
-          vms: "Гипервизор запоминается. Машину выбирают из списка.",
+          vms: "Гипервизор запоминается. Для ESXi логин root, для vCenter — administrator@vsphere.local. Пароль можно ввести заново у сервера.",
           system: "Имя хоста, пояс, адрес интерфейса, шлюз, DNS и правила фаервола.",
           service: "Перезагрузка, выключение и обновление с GitHub.",
           about: "Описание читается из README.md на GitHub.",
@@ -989,7 +989,12 @@
       const catalog = event.target.dataset.catalog;
       if (catalog) {
         try {
-          await send("/api/" + catalog + "/catalog", { id: event.target.dataset.id });
+          const body = { id: event.target.dataset.id };
+          if (catalog === "hosts") {
+            const typed = document.querySelector(`[data-secret="${event.target.dataset.id}"]`);
+            if (typed && typed.value) body.secret = typed.value;
+          }
+          await send("/api/" + catalog + "/catalog", body);
           if (catalog === "sql" && $("sql-log")) $("sql-log").textContent = "Список баз обновлён.";
         } catch (error) {
           if (catalog === "sql" && $("sql-log")) $("sql-log").textContent = error.message;
