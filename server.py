@@ -39,7 +39,7 @@ from hostadmin import (
 )
 from ops import deliver, list_storage, probe, public_copy, run_vm, schedule_due
 
-PRODUCT_VERSION = "1.2.22"
+PRODUCT_VERSION = "1.2.23"
 LOGIN_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
 
 STATE_DIR = Path(os.environ.get("ONEC_STATE_DIR", "/var/lib/onec-console"))
@@ -419,6 +419,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/sql/catalog":
             self._refresh_sql()
+            return
+        if path == "/api/sql/windows":
+            self._save_sql_windows()
             return
         if path == "/api/chosen":
             self._add_chosen()
@@ -1035,6 +1038,26 @@ class Handler(BaseHTTPRequestHandler):
             self._send(400, {"error": message})
             return
         self._send(200, {"catalog": names})
+
+    def _save_sql_windows(self) -> None:
+        payload = self._read_json()
+        login = str(payload.get("fileLogin", "")).strip()
+        secret = str(payload.get("fileSecret", ""))
+        with LOCK:
+            state = load_state()
+            found = False
+            for item in state["sqlServers"]:
+                if item["id"] != payload.get("id"):
+                    continue
+                item["fileLogin"] = login
+                if secret:
+                    item["fileSecret"] = secret
+                found = True
+            if not found:
+                self._send(404, {"error": "Сервер SQL не найден."})
+                return
+            save_state(state)
+        self._send(200, {"ok": True})
 
     def _add_chosen(self) -> None:
         payload = self._read_json()

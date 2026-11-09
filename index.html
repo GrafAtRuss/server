@@ -128,7 +128,7 @@
   <div id="boot" class="login"><p class="muted mono">Открываем консоль…</p></div>
   <form id="login" class="login hidden">
     <div class="card">
-      <p class="eyebrow">1.2.22</p>
+      <p class="eyebrow">1.2.23</p>
       <h1 style="margin-top:12px">Консоль платформы</h1>
       <label class="lbl" for="login-name">Логин</label>
       <input id="login-name" autocomplete="username" style="margin-top:8px" />
@@ -141,7 +141,7 @@
   <div id="app" class="shell hidden">
     <aside>
       <div>
-        <p class="eyebrow" style="color:var(--rail-dim)">1.2.22</p>
+        <p class="eyebrow" style="color:var(--rail-dim)">1.2.23</p>
         <p style="margin:4px 0 0;font-size:18px;font-weight:600">Консоль платформы</p>
       </div>
       <nav class="nav" style="overflow:auto">
@@ -275,10 +275,14 @@
             <input name="name" placeholder="Имя подключения" />
             <input name="host" placeholder="sql.example" />
             <input name="port" value="1433" />
-            <input name="login" placeholder="Логин SQL" />
+            <label class="lbl">Логин SQL</label>
+            <input name="login" placeholder="sa" />
+            <label class="lbl">Пароль SQL</label>
             <input name="secret" type="password" placeholder="Пароль SQL" />
-            <input name="fileLogin" placeholder="Логин Windows для диска C:, необязательно" />
-            <input name="fileSecret" type="password" placeholder="Пароль Windows, необязательно" />
+            <label class="lbl">Логин Windows для диска C:</label>
+            <input name="fileLogin" placeholder="Администратор или ДОМЕН\user" />
+            <label class="lbl">Пароль Windows</label>
+            <input name="fileSecret" type="password" placeholder="Пароль Windows" />
             <button class="dark" type="submit">Запомнить сервер</button>
           </div>
           <div id="sql-list"></div>
@@ -479,7 +483,8 @@
         const options = (item.catalog || []).map((name) => `<option value="${esc(name)}">${esc(name)}</option>`).join("") || `<option value="">Список пуст</option>`;
         const chosen = (state.chosenSql || []).filter((base) => base.sourceId === item.id).map((base) => `<div style="margin-top:12px"><b>${esc(base.name)}</b> <button class="ghost" type="button" data-drop="chosen:${base.id}" data-kind="sql">Убрать</button>${jobsOf("sql", base.id).map(jobHtml).join("")}${jobForm(base.id, "sql")}</div>`).join("");
         const problem = item.catalogError ? `<p class="danger">${esc(item.catalogError)}</p>` : "";
-        return `${row(item, "sql")}<p class="mono muted">${esc(item.host)}:${esc(item.port || "1433")}</p><div class="stack"><button class="ghost" type="button" data-catalog="sql" data-id="${item.id}">Обновить список</button><select data-pick="${item.id}">${options}</select><button class="dark" type="button" data-take="sql" data-source="${item.id}">Взять в работу</button></div>${problem}${chosen}`;
+        const windows = `<label class="lbl">Логин Windows для диска C:</label><input data-win-login="${esc(item.id)}" value="${esc(item.fileLogin || "")}" placeholder="Администратор или ДОМЕН\\user" /><label class="lbl">Пароль Windows</label><input type="password" data-win-secret="${esc(item.id)}" placeholder="Пароль Windows" /><button class="dark" type="button" data-win-save="${esc(item.id)}">Сохранить доступ к диску</button>`;
+        return `${row(item, "sql")}<p class="mono muted">${esc(item.host)}:${esc(item.port || "1433")}</p><div class="stack">${windows}<button class="ghost" type="button" data-catalog="sql" data-id="${item.id}">Обновить список</button><select data-pick="${item.id}">${options}</select><button class="dark" type="button" data-take="sql" data-source="${item.id}">Взять в работу</button></div>${problem}${chosen}`;
       }).join("") || "<p class='muted'>Серверы SQL не подключены.</p>";
       $("users").innerHTML = state.users.map((user) => {
         const self = user.login === state.me.login;
@@ -1037,6 +1042,25 @@
         event.target.dataset.on = on ? "1" : "0";
         event.target.style.background = on ? "var(--pine)" : "";
         event.target.style.color = on ? "#fff" : "";
+        return;
+      }
+      const winSave = event.target.closest("[data-win-save]");
+      if (winSave) {
+        event.preventDefault();
+        const id = winSave.dataset.winSave;
+        const login = document.querySelector(`[data-win-login="${id}"]`);
+        const secret = document.querySelector(`[data-win-secret="${id}"]`);
+        try {
+          await send("/api/sql/windows", {
+            id,
+            fileLogin: login ? login.value : "",
+            fileSecret: secret ? secret.value : ""
+          });
+          if ($("sql-log")) $("sql-log").textContent = "Доступ Windows сохранён. Можно запускать бекап.";
+          await refresh();
+        } catch (error) {
+          if ($("sql-log")) $("sql-log").textContent = error.message;
+        }
         return;
       }
       const catalog = event.target.dataset.catalog;
