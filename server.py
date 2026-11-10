@@ -40,7 +40,7 @@ from hostadmin import (
 )
 from ops import MOUNT_ROOT, cache_root, connect_host, deliver, locate_copy, list_storage, probe, public_copy, run_vm, schedule_due
 
-PRODUCT_VERSION = "1.2.26"
+PRODUCT_VERSION = "1.2.27"
 LOGIN_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
 
 STATE_DIR = Path(os.environ.get("ONEC_STATE_DIR", "/var/lib/onec-console"))
@@ -858,7 +858,10 @@ class Handler(BaseHTTPRequestHandler):
         if not job or not host or not storage:
             self._send(400, {"error": "Бекап, гипервизор или диск не найден."})
             return
-        log = run_vm(job, host, storage)
+        try:
+            log = run_vm(job, host, storage)
+        except RuntimeError as error:
+            log = getattr(error, "log", [str(error)])
         with LOCK:
             fresh = load_state()
             for item in fresh["jobs"]:
@@ -1742,7 +1745,10 @@ def tick() -> None:
         storage = next((item for item in state["storages"] if item["id"] == job["storageId"]), None)
         if not host or not storage:
             continue
-        job["lastLog"] = run_vm(job, host, storage)
+        try:
+            job["lastLog"] = run_vm(job, host, storage)
+        except RuntimeError as error:
+            job["lastLog"] = getattr(error, "log", [str(error)])
         job["lastSlot"] = now.strftime("%Y-%m-%dT%H:%M")
         changed = True
     for job in state.get("backupJobs", []):

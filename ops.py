@@ -344,6 +344,11 @@ def entry(name: str, is_dir: bool, size, modified: str, rel: str) -> dict:
     return {"name": name, "kind": "dir" if is_dir else "file", "size": number, "modified": modified or "", "path": next_path}
 
 
+def timed_out(error: Exception) -> bool:
+    text = str(error).lower()
+    return isinstance(error, TimeoutError) or "timed out" in text or "timeout" in text
+
+
 def run_vm(job: dict, host: dict, storage: dict, step=None) -> list:
     log = []
 
@@ -359,37 +364,67 @@ def run_vm(job: dict, host: dict, storage: dict, step=None) -> list:
         note(90, "включение", "включение")
         return log
     turned_off = False
+    requested_off = False
     control = None
+    failed = ""
     try:
         note(20, "подключение к гипервизору", f"подключение к {host.get('host', '')}")
         control = connect_host(host)
         note(30, "мягкое выключение", f"мягкое выключение {job['vmName']}")
-        control.shutdown(job["vmName"])
-        if not control.wait_off(job["vmName"]):
-            note(100, "ошибка", "машина не выключилась за 3 минуты, бекап отменён")
-            return log
-        turned_off = True
-        note(55, "машина выключена", "машина выключена")
-        stamp_dir = Path(job["stampDir"]) if job.get("stampDir") else None
-        if stamp_dir is None:
-            folder = MOUNT_ROOT / storage["id"] / "vms" / safe_name(job["vmName"])
-            stamp_dir = folder / datetime.now().strftime("%Y%m%d-%H%M%S")
+
+        def waiting(elapsed: int) -> None:
+            note(40, "жду выключения", f"жду выключения, {elapsed} с")
+
+        try:
+            control.shutdown(job["vmName"])
+            requested_off = True
+        except Exception as error:
+            requested_off = True
+            if timed_out(error):
+                note(35, "жду выключения", "запрос выключения отправлен, ответ гипервизора не дождались и проверяю состояние")
+            else:
+                note(35, "выключение питанием", f"мягкое выключение не принято: {error}. Выключаю питанием.")
+                control.power_off(job["vmName"])
+        if not control.wait_off(job["vmName"], seconds=600, tick=waiting):
+            note(45, "выключение питанием", "мягкое выключение не завершилось, выключаю питанием")
+            control.power_off(job["vmName"])
+            if not control.wait_off(job["vmName"], seconds=120, tick=waiting):
+                failed = "машина не выключилась, бекап отменён"
+                note(100, "ошибка", failed)
+            else:
+                turned_off = True
+        else:
+            turned_off = True
+        if turned_off:
+            note(55, "машина выключена", "машина выключена")
+            stamp_dir = Path(job["stampDir"]) if job.get("stampDir") else None
+            if stamp_dir is None:
+                folder = MOUNT_ROOT / storage["id"] / "vms" / safe_name(job["vmName"])
+                stamp_dir = folder / datetime.now().strftime("%Y%m%d-%H%M%S")
+                stamp_dir.mkdir(parents=True, exist_ok=True)
             stamp_dir.mkdir(parents=True, exist_ok=True)
-        stamp_dir.mkdir(parents=True, exist_ok=True)
-        note_path = stamp_dir / "backup.txt"
-        note_path.write_text(f"{job['vmName']} off, host {host['host']}\n", encoding="utf-8")
-        note(65, "копирование файлов", f"отметка бекапа {note_path}")
-        copied = copy_vm_files(host, job["vmName"], stamp_dir)
-        note(80, "копирование файлов", copied)
+            note_path = stamp_dir / "backup.txt"
+            note_path.write_text(f"{job['vmName']} off, host {host['host']}\n", encoding="utf-8")
+            note(65, "копирование файлов", f"отметка бекапа {note_path}")
+            copied = copy_vm_files(host, job["vmName"], stamp_dir)
+            note(80, "копирование файлов", copied)
+            if not str(copied).startswith("файлы ВМ записаны"):
+                failed = copied
+                note(100, "ошибка", copied)
     except Exception as error:
-        note(100, "ошибка", str(error))
+        failed = str(error)
+        note(100, "ошибка", failed)
     finally:
-        if turned_off and control:
+        if requested_off and control:
             try:
                 control.power_on(job["vmName"])
                 note(90, "включение", f"включение {job['vmName']}")
             except Exception as error:
                 note(90, "ошибка включения", f"не удалось включить: {error}")
+    if failed:
+        error = RuntimeError(failed)
+        error.log = log
+        raise error
     return log
 
 
@@ -436,15 +471,15 @@ def api_base(host: str) -> str:
     return urllib.parse.urlunsplit((parts.scheme or "https", parts.netloc, "", "", ""))
 
 
-def http_exchange(url: str, method: str, headers: dict, body: bytes = b"", keep_method: bool = False):
+def http_exchange(url: str, method: str, headers: dict, body: bytes = b"", keep_method: bool = False, timeout: int = 60):
     current = url
     payload = body
     for _ in range(5):
         parts = urllib.parse.urlsplit(current)
         if parts.scheme == "https":
-            conn = http.client.HTTPSConnection(parts.hostname, parts.port or 443, timeout=25, context=CTX)
+            conn = http.client.HTTPSConnection(parts.hostname, parts.port or 443, timeout=timeout, context=CTX)
         else:
-            conn = http.client.HTTPConnection(parts.hostname, parts.port or 80, timeout=25)
+            conn = http.client.HTTPConnection(parts.hostname, parts.port or 80, timeout=timeout)
         path = parts.path or "/"
         if parts.query:
             path += "?" + parts.query
@@ -620,10 +655,33 @@ class RestHost:
 
     def shutdown(self, name: str) -> None:
         self.vm_id = find_vm(self.base, self.root, self.session, name)
-        api(self.base, self.root, self.session, f"/vcenter/vm/{urllib.parse.quote(self.vm_id, safe='')}/guest/power?action=shutdown", method="POST")
+        try:
+            api(self.base, self.root, self.session, f"/vcenter/vm/{urllib.parse.quote(self.vm_id, safe='')}/guest/power?action=shutdown", method="POST", timeout=45)
+        except Exception as error:
+            if not timed_out(error):
+                raise
 
-    def wait_off(self, name: str) -> bool:
-        return wait_off(self.base, self.root, self.session, self.vm_id)
+    def wait_off(self, name: str, seconds: int = 600, tick=None) -> bool:
+        return wait_off(self.base, self.root, self.session, self.vm_id, seconds=seconds, tick=tick)
+
+    def power_off(self, name: str) -> None:
+        if not self.vm_id:
+            self.vm_id = find_vm(self.base, self.root, self.session, name)
+        encoded = urllib.parse.quote(self.vm_id, safe="")
+        last = ""
+        for path in (
+            f"/vcenter/vm/{encoded}/power/stop",
+            f"/vcenter/vm/{encoded}/power?action=stop",
+        ):
+            try:
+                api(self.base, self.root, self.session, path, method="POST", timeout=120)
+                return
+            except RuntimeError as error:
+                last = str(error)
+                if "404" not in last and "Not found" not in last and "httpNotFound" not in last:
+                    break
+        soap = SoapHost.login(self.base, self.login, self.secret, self.kind)
+        soap.power_off(name)
 
     def power_on(self, name: str) -> None:
         try:
@@ -726,16 +784,34 @@ class SoapHost:
 
     def shutdown(self, name: str) -> None:
         moref = self.moref(name)
-        soap_call(self.base, f"<urn:ShutdownGuest><urn:_this type=\"VirtualMachine\">{xml_escape(moref)}</urn:_this></urn:ShutdownGuest>", self.cookie, self.action, self.style)
+        try:
+            soap_call(self.base, f"<urn:ShutdownGuest><urn:_this type=\"VirtualMachine\">{xml_escape(moref)}</urn:_this></urn:ShutdownGuest>", self.cookie, self.action, self.style, timeout=45)
+        except Exception as error:
+            if not timed_out(error):
+                raise
 
-    def wait_off(self, name: str) -> bool:
+    def wait_off(self, name: str, seconds: int = 600, tick=None) -> bool:
         moref = self.moref(name)
-        deadline = time.time() + 180
+        started = time.time()
+        deadline = started + seconds
+        last = 0
         while time.time() < deadline:
-            if soap_power(self, moref) == "poweredOff":
-                return True
+            try:
+                if soap_power(self, moref) == "poweredOff":
+                    return True
+            except Exception as error:
+                if not timed_out(error):
+                    raise
+            elapsed = int(time.time() - started)
+            if tick and elapsed - last >= 20:
+                last = elapsed
+                tick(elapsed)
             time.sleep(5)
         return False
+
+    def power_off(self, name: str) -> None:
+        moref = self.moref(name)
+        soap_call(self.base, f"<urn:PowerOffVM_Task><urn:_this type=\"VirtualMachine\">{xml_escape(moref)}</urn:_this></urn:PowerOffVM_Task>", self.cookie, self.action, self.style, timeout=120)
 
     def power_on(self, name: str) -> None:
         moref = self.moref(name)
@@ -749,7 +825,7 @@ class SoapHost:
         return self.morefs[name]
 
 
-def soap_call(base: str, body: str, cookie: str = "", action: str = '"urn:vim25/7.0"', style: str = "plain") -> tuple[str, str]:
+def soap_call(base: str, body: str, cookie: str = "", action: str = '"urn:vim25/7.0"', style: str = "plain", timeout: int = 60) -> tuple[str, str]:
     fragment = body
     if style == "plain":
         fragment = body.replace("<urn:", "<").replace("</urn:", "</")
@@ -763,7 +839,7 @@ def soap_call(base: str, body: str, cookie: str = "", action: str = '"urn:vim25/
     headers = {"Content-Type": "text/xml; charset=utf-8", "SOAPAction": action}
     if cookie:
         headers["Cookie"] = cookie.split(";", 1)[0]
-    status, raw, response_headers = http_exchange(base.rstrip("/") + "/sdk", "POST", headers, xml, keep_method=True)
+    status, raw, response_headers = http_exchange(base.rstrip("/") + "/sdk", "POST", headers, xml, keep_method=True, timeout=timeout)
     payload = raw.decode("utf-8", "replace")
     fault = soap_fault(payload)
     if status >= 400 or fault:
@@ -832,13 +908,14 @@ def soap_power(host: SoapHost, moref: str) -> str:
     return soap_value(payload, "val")
 
 
-def api(base: str, root: str, session: str, path: str, method="GET"):
+def api(base: str, root: str, session: str, path: str, method="GET", timeout: int = 60):
     status, raw, _ = http_exchange(
         base.rstrip("/") + root + path,
         method,
         {"vmware-api-session-id": session, "Accept": "application/json"},
         b"" if method != "GET" else None,
         keep_method=method != "GET",
+        timeout=timeout,
     )
     body = raw.decode("utf-8", "replace")
     if status >= 400:
@@ -857,13 +934,28 @@ def find_vm(base: str, root: str, session: str, name: str) -> str:
     raise RuntimeError(f"машина {name} не найдена")
 
 
-def wait_off(base: str, root: str, session: str, vm_id: str) -> bool:
-    deadline = time.time() + 180
+def wait_off(base: str, root: str, session: str, vm_id: str, seconds: int = 600, tick=None) -> bool:
+    started = time.time()
+    deadline = started + seconds
+    last = 0
     while time.time() < deadline:
-        payload = api(base, root, session, f"/vcenter/vm/{vm_id}/power")
-        state = payload.get("state") if isinstance(payload, dict) and "state" in payload else payload.get("value", {}).get("state")
-        if state == "POWERED_OFF":
-            return True
+        try:
+            payload = api(base, root, session, f"/vcenter/vm/{urllib.parse.quote(vm_id, safe='')}/power", timeout=60)
+            if isinstance(payload, dict) and "state" in payload:
+                state = payload.get("state")
+            elif isinstance(payload, dict):
+                state = payload.get("value", {}).get("state")
+            else:
+                state = ""
+            if state == "POWERED_OFF":
+                return True
+        except Exception as error:
+            if not timed_out(error):
+                raise
+        elapsed = int(time.time() - started)
+        if tick and elapsed - last >= 20:
+            last = elapsed
+            tick(elapsed)
         time.sleep(5)
     return False
 
