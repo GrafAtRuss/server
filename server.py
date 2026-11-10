@@ -40,7 +40,7 @@ from hostadmin import (
 )
 from ops import MOUNT_ROOT, Stopped, bind_job, cache_root, check_job, connect_host, deliver, extract_vm_files, job_stopped, kill_proc, locate_copy, locate_vm_dir, list_storage, probe, public_copy, run_vm, schedule_due, stop_job, track_proc, untrack_proc, upload_vm_http
 
-PRODUCT_VERSION = "1.2.31"
+PRODUCT_VERSION = "1.2.32"
 LOGIN_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
 
 STATE_DIR = Path(os.environ.get("ONEC_STATE_DIR", "/var/lib/onec-console"))

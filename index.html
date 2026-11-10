@@ -92,7 +92,23 @@
     .meter span { display: block; height: 100%; background: var(--pine); }
     .shell { min-height: 100vh; }
     @media (min-width: 960px) {
-      .shell { display: grid; grid-template-columns: 240px 1fr; }
+      .shell { display: block; }
+      .shell > aside {
+        position: fixed;
+        top: 0;
+        left: 0;
+        z-index: 5;
+        width: 240px;
+        height: 100vh;
+        overflow: auto;
+        display: flex;
+        flex-direction: column;
+        align-items: stretch;
+        padding: 28px 20px;
+      }
+      .shell > aside .nav { margin-top: 28px; display: flex; flex-direction: column; gap: 8px; flex: 1; }
+      .shell > aside .who { margin-top: auto; }
+      main { margin-left: 240px; }
     }
     aside {
       background: var(--rail);
@@ -102,11 +118,6 @@
       align-items: center;
       justify-content: space-between;
       gap: 12px;
-    }
-    @media (min-width: 960px) {
-      aside { display: flex; flex-direction: column; align-items: stretch; padding: 28px 20px; }
-      .nav { margin-top: 28px; display: flex; flex-direction: column; gap: 8px; }
-      .who { margin-top: auto; }
     }
     .nav { display: flex; gap: 8px; }
     .nav button { height: 44px; border: 0; border-radius: 12px; background: transparent; color: var(--rail-dim); padding: 0 12px; text-align: left; }
@@ -149,7 +160,7 @@
   <div id="boot" class="login"><p class="muted mono">Открываем консоль…</p></div>
   <form id="login" class="login hidden">
     <div class="card">
-      <p class="eyebrow">1.2.31</p>
+      <p class="eyebrow">1.2.32</p>
       <h1 style="margin-top:12px">Консоль платформы</h1>
       <label class="lbl" for="login-name">Логин</label>
       <input id="login-name" autocomplete="username" style="margin-top:8px" />
@@ -162,7 +173,7 @@
   <div id="app" class="shell hidden">
     <aside>
       <div>
-        <p class="eyebrow" style="color:var(--rail-dim)">1.2.31</p>
+        <p class="eyebrow" style="color:var(--rail-dim)">1.2.32</p>
         <p style="margin:4px 0 0;font-size:18px;font-weight:600">Консоль платформы</p>
       </div>
       <nav class="nav" style="overflow:auto">
