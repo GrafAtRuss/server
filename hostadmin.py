@@ -1078,3 +1078,66 @@ def sql_backup(server: dict, database: str, storage: dict, stamp: Path) -> str:
     local = stamp / file_name
     note = pull_bak(server, target, local)
     return f"бекап {database} → {target}; {note}"
+
+
+def push_bak_smb(server: dict, local: Path, remote: str) -> None:
+    if shutil.which("smbclient") is None and not apt_install(["smbclient"]):
+        raise RuntimeError("нет smbclient")
+    login = str(server.get("fileLogin") or server.get("login") or "").strip()
+    secret = str(server.get("fileSecret") or ("" if server.get("fileLogin") else server.get("secret", "")))
+    domain = ""
+    user = login
+    if "\\" in login:
+        domain, user = login.split("\\", 1)
+    auth = Path(f"/tmp/onec-smb-put-{os.getpid()}.auth")
+    lines = [f"username = {user}", f"password = {secret}"]
+    if domain:
+        lines.append(f"domain = {domain}")
+    auth.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    auth.chmod(0o600)
+    relative = remote[3:].replace("\\", "/")
+    folder = str(Path(relative).parent).replace("\\", "/")
+    try:
+        result = subprocess.run(
+            [
+                "smbclient",
+                f"//{sql_machine(server)}/C$",
+                "-A",
+                str(auth),
+                "-c",
+                f'mkdir "onec-backup"; mkdir "{folder}"; put "{local}" "{relative}"',
+            ],
+            text=True,
+            capture_output=True,
+            timeout=7200,
+            check=False,
+        )
+    finally:
+        auth.unlink(missing_ok=True)
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "smbclient не записал файл").strip()
+        raise RuntimeError(detail[:300])
+
+
+def sql_restore(server: dict, database: str, storage: dict, bak: Path) -> str:
+    file_name = bak.name
+    if storage.get("kind") == "cifs":
+        root = (MOUNT_ROOT / storage["id"]).resolve()
+        relative = bak.resolve().relative_to(root).as_posix()
+        target = cifs_unc(storage.get("endpoint", ""), str(Path(relative).parent).replace("\\", "/")) + "\\" + file_name
+    elif not remote_sql(server):
+        target = str(bak)
+    else:
+        target = f"C:\\onec-backup\\restore\\{file_name}"
+        push_bak_smb(server, bak, target)
+    ident = sql_ident(database)
+    literal = target.replace("'", "''")
+    sql_exec(server, f"ALTER DATABASE {ident} SET SINGLE_USER WITH ROLLBACK IMMEDIATE", timeout=120)
+    try:
+        sql_exec(server, f"RESTORE DATABASE {ident} FROM DISK = N'{literal}' WITH REPLACE", timeout=7200)
+    finally:
+        try:
+            sql_exec(server, f"ALTER DATABASE {ident} SET MULTI_USER", timeout=120)
+        except Exception:
+            pass
+    return f"база {database} восстановлена из {target}"

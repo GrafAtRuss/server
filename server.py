@@ -30,6 +30,7 @@ from hostadmin import (
     schedule_update,
     sql_backup,
     sql_catalog,
+    sql_restore,
     update_offer,
     update_status,
     vm_catalog,
@@ -37,9 +38,9 @@ from hostadmin import (
     ensure_soname,
     apt_install,
 )
-from ops import deliver, list_storage, probe, public_copy, run_vm, schedule_due
+from ops import MOUNT_ROOT, cache_root, connect_host, deliver, locate_copy, list_storage, probe, public_copy, run_vm, schedule_due
 
-PRODUCT_VERSION = "1.2.25"
+PRODUCT_VERSION = "1.2.26"
 LOGIN_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
 
 STATE_DIR = Path(os.environ.get("ONEC_STATE_DIR", "/var/lib/onec-console"))
@@ -96,6 +97,7 @@ def blank_state() -> dict:
         "sqlServers": [],
         "chosenSql": [],
         "backupJobs": [],
+        "copies": [],
     }
 
 
@@ -312,6 +314,10 @@ class Handler(BaseHTTPRequestHandler):
                         {key: value for key, value in item.items() if key != "baseSecret"}
                         for item in state["backupJobs"]
                     ],
+                    "copies": [
+                        {key: value for key, value in item.items() if key != "baseSecret"}
+                        for item in state.get("copies", [])
+                    ],
                 },
             )
             return
@@ -435,6 +441,15 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/backup-jobs/user":
             self._save_base_user()
             return
+        if path == "/api/backup-jobs/edit":
+            self._edit_backup_job()
+            return
+        if path == "/api/connections/edit":
+            self._edit_connection()
+            return
+        if path == "/api/copies/restore":
+            self._restore_copy()
+            return
         if path == "/api/backup-jobs/run":
             self._run_backup_job()
             return
@@ -486,6 +501,9 @@ class Handler(BaseHTTPRequestHandler):
         elif parsed.path == "/api/backup-jobs":
             item_id = query.get("id", [""])[0]
             state["backupJobs"] = [item for item in state["backupJobs"] if item["id"] != item_id]
+        elif parsed.path == "/api/copies":
+            item_id = query.get("id", [""])[0]
+            state["copies"] = [item for item in state.get("copies", []) if item["id"] != item_id]
         elif parsed.path == "/api/jobs":
             item_id = query.get("id", [""])[0]
             state["jobs"] = [item for item in state["jobs"] if item["id"] != item_id]
@@ -497,7 +515,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         with LOCK:
             fresh = load_state()
-            for key in ("users", "sessions", "storages", "hosts", "jobs", "bases", "clusters", "chosenBases", "chosenVms", "sqlServers", "chosenSql", "backupJobs"):
+            for key in ("users", "sessions", "storages", "hosts", "jobs", "bases", "clusters", "chosenBases", "chosenVms", "sqlServers", "chosenSql", "backupJobs", "copies"):
                 fresh[key] = state[key]
             save_state(fresh)
         self._send(200, {"ok": True})
@@ -1131,6 +1149,87 @@ class Handler(BaseHTTPRequestHandler):
             save_state(state)
         self._send(200, {"ok": True})
 
+    def _edit_backup_job(self) -> None:
+        payload = self._read_json()
+        with LOCK:
+            state = load_state()
+            job = next((item for item in state["backupJobs"] if item["id"] == payload.get("id")), None)
+            if not job:
+                self._send(404, {"error": "Бекап не найден."})
+                return
+            if payload.get("storageId"):
+                job["storageId"] = payload.get("storageId")
+            if "folder" in payload:
+                job["folder"] = clean_folder(payload.get("folder"))
+            if "cloudFolder" in payload:
+                job["cloudFolder"] = clean_folder(payload.get("cloudFolder"))
+            if "copyIds" in payload:
+                job["copyIds"] = payload.get("copyIds") or []
+            if "schedule" in payload:
+                job["schedule"] = read_schedule(payload.get("schedule"))
+            if job.get("kind") == "base":
+                login = str(payload.get("baseLogin", "")).strip()
+                if login:
+                    job["baseLogin"] = login
+                if payload.get("baseSecret"):
+                    job["baseSecret"] = str(payload.get("baseSecret"))
+            save_state(state)
+        self._send(200, {"ok": True})
+
+    def _edit_connection(self) -> None:
+        payload = self._read_json()
+        kind = payload.get("list")
+        keys = {"clusters": "clusters", "hosts": "hosts", "sql": "sqlServers", "storages": "storages"}
+        key = keys.get(kind)
+        if not key:
+            self._send(400, {"error": "Неизвестное подключение."})
+            return
+        with LOCK:
+            state = load_state()
+            item = next((row for row in state[key] if row["id"] == payload.get("id")), None)
+            if not item:
+                self._send(404, {"error": "Подключение не найдено."})
+                return
+            for field in ("name", "host", "endpoint", "login", "port", "kind", "fileLogin"):
+                if field in payload and str(payload.get(field, "")).strip():
+                    item[field] = str(payload.get(field)).strip()
+            if payload.get("secret"):
+                item["secret"] = str(payload.get("secret"))
+            if payload.get("fileSecret"):
+                item["fileSecret"] = str(payload.get("fileSecret"))
+            if kind == "storages":
+                ok, detail = probe(item)
+                item["status"] = "ready" if ok else "error"
+                item["detail"] = detail
+            save_state(state)
+        self._send(200, {"ok": True})
+
+    def _restore_copy(self) -> None:
+        payload = self._read_json()
+        copy_id = payload.get("id")
+        with LOCK:
+            state = load_state()
+            copy = next((item for item in state.get("copies", []) if item["id"] == copy_id), None)
+            if not copy:
+                self._send(404, {"error": "Копия не найдена."})
+                return
+            if copy.get("running"):
+                self._send(400, {"error": "Восстановление уже идёт."})
+                return
+            copy["running"] = True
+            copy["lastLog"] = [stamp_line("запуск восстановления")]
+            save_state(state)
+
+        def work() -> None:
+            try:
+                restore_saved(copy_id)
+                push_copy(copy_id, "восстановление завершено", False)
+            except Exception as error:
+                push_copy(copy_id, str(error), False)
+
+        threading.Thread(target=work, daemon=True).start()
+        self._send(200, {"ok": True})
+
     def _run_backup_job(self) -> None:
         payload = self._read_json()
         with LOCK:
@@ -1224,6 +1323,173 @@ def clean_folder(value) -> str:
         return ""
 
 
+def copy_rel(storage: dict, stamp: Path) -> str:
+    if storage.get("kind") in ("cifs", "nfs"):
+        root = (MOUNT_ROOT / storage["id"]).resolve()
+    else:
+        root = (cache_root() / "stage" / storage["id"]).resolve()
+    return stamp.resolve().relative_to(root).as_posix()
+
+
+def remember_copy(job: dict, storage: dict, stamp: Path, name: str, source_id: str) -> None:
+    useful = [
+        path for path in stamp.iterdir()
+        if path.is_file() and path.stat().st_size > 0 and path.suffix.lower() in {".cf", ".bak", ".tar"}
+    ]
+    if not useful or not name:
+        return
+    try:
+        rel = copy_rel(storage, stamp)
+    except ValueError:
+        return
+    with LOCK:
+        state = load_state()
+        state.setdefault("copies", []).append(
+            {
+                "id": secrets.token_hex(8),
+                "kind": job.get("kind"),
+                "name": name,
+                "storageId": storage["id"],
+                "storageName": storage.get("name", ""),
+                "rel": rel,
+                "stamp": stamp.name,
+                "created": datetime_stamp(),
+                "sourceId": source_id,
+                "baseLogin": job.get("baseLogin", ""),
+                "baseSecret": job.get("baseSecret", ""),
+                "running": False,
+                "lastLog": [],
+            }
+        )
+        save_state(state)
+
+
+def datetime_stamp() -> str:
+    from datetime import datetime
+
+    return datetime.now().strftime("%Y-%m-%d %H:%M")
+
+
+def push_copy(copy_id: str, line: str = "", running: bool = True) -> None:
+    with LOCK:
+        state = load_state()
+        for item in state.get("copies", []):
+            if item["id"] != copy_id:
+                continue
+            item["running"] = running
+            if line:
+                log = item.setdefault("lastLog", [])
+                log.append(stamp_line(line))
+                if len(log) > 80:
+                    del log[:-80]
+        save_state(state)
+
+
+def restore_saved(copy_id: str) -> None:
+    with LOCK:
+        state = load_state()
+    copy = next((item for item in state.get("copies", []) if item["id"] == copy_id), None)
+    if not copy:
+        raise RuntimeError("копия не найдена")
+    storage = next((item for item in state["storages"] if item["id"] == copy.get("storageId")), None)
+    if not storage:
+        raise RuntimeError("хранилище копии не найдено")
+    push_copy(copy_id, "ищу файлы копии")
+    folder = locate_copy(storage, copy.get("rel", ""))
+    kind = copy.get("kind")
+    if kind == "sql":
+        server = next((item for item in state["sqlServers"] if item["id"] == copy.get("sourceId")), None)
+        bak = next((path for path in folder.glob("*.bak") if path.is_file()), None)
+        if not server or not bak:
+            raise RuntimeError("нет сервера SQL или файла bak")
+        push_copy(copy_id, f"восстанавливаю {copy['name']} из {bak.name}")
+        push_copy(copy_id, sql_restore(server, copy["name"], storage, bak))
+        return
+    if kind == "vm":
+        host = next((item for item in state["hosts"] if item["id"] == copy.get("sourceId")), None)
+        if not host or not (folder / "vm.tar").is_file():
+            raise RuntimeError("нет гипервизора или файла vm.tar")
+        restore_vm_files(host, copy["name"], folder, lambda line: push_copy(copy_id, line))
+        return
+    cluster = next((item for item in state["clusters"] if item["id"] == copy.get("sourceId")), None)
+    config = folder / "config.cf"
+    binary = (state.get("installed") or {}).get("binary")
+    if not cluster or not binary or not config.is_file() or config.stat().st_size == 0:
+        raise RuntimeError("нет кластера, платформы или файла конфигурации")
+    push_copy(copy_id, f"загружаю конфигурацию в {copy['name']}")
+    code, output = load_config(binary, cluster, f"{cluster['host']}\\{copy['name']}", config, copy)
+    if output:
+        push_copy(copy_id, output[-500:])
+    if code != 0:
+        raise RuntimeError(output or "конфигуратор не восстановил базу")
+
+
+def load_config(binary: str, cluster: dict, target: str, config: Path, copy: dict) -> tuple:
+    if copy.get("baseLogin"):
+        login = str(copy.get("baseLogin") or "")
+        password = str(copy.get("baseSecret") or "")
+    else:
+        login = str(cluster.get("login") or "")
+        password = str(cluster.get("secret") or "")
+    out_file = config.parent / "restore-out.txt"
+    command = [
+        binary, "DESIGNER", "/S", target, "/N", login, "/P", password,
+        "/DisableStartupDialogs", "/Out", str(out_file), "/LoadCfg", str(config), "/UpdateDBCfg",
+    ]
+    env = os.environ.copy()
+    env.setdefault("HOME", "/root")
+    env.setdefault("GDK_BACKEND", "x11")
+    if not env.get("DISPLAY"):
+        if shutil.which("xvfb-run") is None:
+            apt_install(["xvfb"])
+        if shutil.which("xvfb-run"):
+            command = ["xvfb-run", "-a", *command]
+    result = subprocess.run(command, capture_output=True, text=True, env=env, timeout=7200)
+    text = designer_report(out_file) or (result.stderr or result.stdout or "").strip()
+    if result.returncode == 0:
+        return 0, text
+    return result.returncode or 1, text or "конфигуратор завершился с ошибкой"
+
+
+def restore_vm_files(host: dict, name: str, folder: Path, note) -> None:
+    archive = folder / "vm.tar"
+    note("выключаю машину")
+    control = connect_host(host)
+    control.shutdown(name)
+    if not control.wait_off(name):
+        raise RuntimeError("машина не выключилась")
+    try:
+        if shutil.which("sshpass") is None:
+            raise RuntimeError("нет sshpass, файлы вернуть нельзя")
+        target = f"{host['login']}@{str(host['host']).split('://')[-1].split('/')[0]}"
+        safe = name.replace("'", "")
+        remote = f"vim-cmd vmsvc/getallvms | awk -F '  +' -v n='{safe}' '$2==n {{print $4}}'"
+        result = subprocess.run(
+            ["sshpass", "-p", host["secret"], "ssh", "-o", "StrictHostKeyChecking=accept-new", target, remote],
+            text=True,
+            capture_output=True,
+            timeout=40,
+            check=False,
+        )
+        vmx = (result.stdout or "").strip().splitlines()
+        if result.returncode != 0 or not vmx:
+            raise RuntimeError("каталог ВМ на ESXi не найден")
+        directory = str(Path(vmx[0]).parent)
+        note(f"возвращаю файлы в {directory}")
+        stream = subprocess.run(
+            ["sshpass", "-p", host["secret"], "ssh", "-o", "StrictHostKeyChecking=accept-new", target, "tar", "-C", directory, "-xf", "-"],
+            stdin=archive.open("rb"),
+            stderr=subprocess.PIPE,
+            timeout=3600,
+            check=False,
+        )
+        if stream.returncode != 0:
+            raise RuntimeError((stream.stderr or b"").decode("utf-8", "replace")[:400] or "tar не записал файлы")
+    finally:
+        control.power_on(name)
+        note("машина включается")
+
+
 def perform_backup(state: dict, job: dict) -> list:
     storage = next((item for item in state["storages"] if item["id"] == job["storageId"]), None)
     lines = []
@@ -1239,6 +1505,8 @@ def perform_backup(state: dict, job: dict) -> list:
         return lines
     keep = int((job.get("schedule") or {}).get("keepDays") or 0)
     folder = job.get("folder") or ""
+    chosen_name = ""
+    source_id = ""
     progress(5, "подготовка", "запуск резервного копирования")
     try:
         if job["kind"] == "vm":
@@ -1249,6 +1517,8 @@ def perform_backup(state: dict, job: dict) -> list:
                 return lines
             progress(10, "создаю папку", "создаю папку бекапа")
             stamp, parent = open_backup(storage, folder, "vms", chosen["name"])
+            chosen_name = chosen["name"]
+            source_id = host["id"]
             progress(15, "папка готова", f"папка создана: {parent}")
             vm_job = {**job, "vmName": chosen["name"], "stampDir": str(stamp)}
 
@@ -1264,6 +1534,8 @@ def perform_backup(state: dict, job: dict) -> list:
                 return lines
             progress(10, "создаю папку", "создаю папку бекапа")
             stamp, parent = open_backup(storage, folder, "sql", chosen["name"])
+            chosen_name = chosen["name"]
+            source_id = sql_server["id"]
             progress(20, "папка готова", f"папка создана: {parent}")
             progress(30, "SQL Server пишет копию", f"запускаю BACKUP DATABASE {chosen['name']}")
             stop = threading.Event()
@@ -1288,6 +1560,8 @@ def perform_backup(state: dict, job: dict) -> list:
                 return lines
             progress(8, "создаю папку", "создаю папку бекапа")
             stamp, parent = open_backup(storage, folder, "bases", chosen["name"])
+            chosen_name = chosen["name"]
+            source_id = cluster["id"]
             target = f"{cluster['host']}\\{chosen['name']}"
             progress(12, "папка готова", f"папка создана: {parent}")
             installed = state.get("installed") or {}
@@ -1309,9 +1583,12 @@ def perform_backup(state: dict, job: dict) -> list:
     if stamp.is_dir() and any(stamp.iterdir()):
         progress(86, "сохраняю в хранилище", "переношу файлы в хранилище")
         if storage.get("kind") not in ("cifs", "nfs"):
-            progress(90, "сохраняю в хранилище", deliver(storage, folder, stamp))
+            rel = copy_rel(storage, stamp)
+            parent_rel = "" if rel == stamp.name else str(Path(rel).parent)
+            progress(90, "сохраняю в хранилище", deliver(storage, parent_rel, stamp))
         else:
             progress(90, "файлы на диске", f"папка {stamp}")
+        remember_copy(job, storage, stamp, chosen_name, source_id)
         copies = job.get("copyIds") or []
         for index, cloud_id in enumerate(copies):
             cloud = next((item for item in state["storages"] if item["id"] == cloud_id and item.get("role") == "cloud"), None)

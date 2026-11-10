@@ -67,6 +67,27 @@
     }
     .primary { background: var(--copper); color: var(--copper-ink); }
     .dark { background: var(--ink); color: var(--paper); }
+    .ghost, label.file {
+      height: 40px;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: var(--card);
+      color: var(--ink);
+      padding: 0 14px;
+      font-weight: 500;
+    }
+    label.file { display: inline-flex; align-items: center; margin-top: 8px; }
+    .modal {
+      position: fixed;
+      inset: 0;
+      z-index: 30;
+      display: grid;
+      place-items: center;
+      padding: 16px;
+      background: rgba(26, 24, 20, 0.45);
+    }
+    .modal.hidden { display: none; }
+    .modal .panel { width: min(560px, 100%); max-height: 90vh; overflow: auto; }
     .meter { height: 8px; background: var(--line); border-radius: 99px; overflow: hidden; margin: 8px 0; }
     .meter span { display: block; height: 100%; background: var(--pine); }
     .shell { min-height: 100vh; }
@@ -128,7 +149,7 @@
   <div id="boot" class="login"><p class="muted mono">Открываем консоль…</p></div>
   <form id="login" class="login hidden">
     <div class="card">
-      <p class="eyebrow">1.2.25</p>
+      <p class="eyebrow">1.2.26</p>
       <h1 style="margin-top:12px">Консоль платформы</h1>
       <label class="lbl" for="login-name">Логин</label>
       <input id="login-name" autocomplete="username" style="margin-top:8px" />
@@ -141,7 +162,7 @@
   <div id="app" class="shell hidden">
     <aside>
       <div>
-        <p class="eyebrow" style="color:var(--rail-dim)">1.2.25</p>
+        <p class="eyebrow" style="color:var(--rail-dim)">1.2.26</p>
         <p style="margin:4px 0 0;font-size:18px;font-weight:600">Консоль платформы</p>
       </div>
       <nav class="nav" style="overflow:auto">
@@ -250,6 +271,7 @@
           </div>
           <div id="host-list"></div>
         </form>
+        <div id="vm-copies" class="panel"></div>
         <pre id="vm-log" class="log">Журнал выключения, копии и включения появится здесь.</pre>
       </section>
       <section id="tab-bases" class="hidden">
@@ -266,6 +288,7 @@
           </div>
           <div id="cluster-list"></div>
         </form>
+        <div id="base-copies" class="panel" style="margin-top:16px"></div>
       </section>
       <section id="tab-sql" class="hidden">
         <form id="sql-form" class="panel">
@@ -287,6 +310,7 @@
           </div>
           <div id="sql-list"></div>
         </form>
+        <div id="sql-copies" class="panel" style="margin-top:16px"></div>
         <pre id="sql-log" class="log">Журнал бекапа .bak появится здесь.</pre>
       </section>
       <section id="tab-system" class="hidden grid">
@@ -392,6 +416,16 @@
       </section>
     </main>
   </div>
+  <div id="editor" class="modal hidden">
+    <form id="editor-form" class="panel">
+      <strong id="editor-title">Правка</strong>
+      <div id="editor-fields" class="stack"></div>
+      <div style="display:flex;gap:8px;margin-top:16px">
+        <button class="primary" type="submit">Сохранить</button>
+        <button id="editor-close" class="ghost" type="button">Закрыть</button>
+      </div>
+    </form>
+  </div>
   <script>
     const $ = (id) => document.getElementById(id);
     const ROLE = {
@@ -415,7 +449,11 @@
       $("app").classList.toggle("hidden", name !== "app");
     }
 
+    let viewState = null;
+    let editor = null;
+
     function render(state) {
+      viewState = state;
       me = state.me;
       show("app");
       $("who-name").textContent = state.me.name;
@@ -441,8 +479,8 @@
       }
       $("log").textContent = (state.log || []).join("\n") || "Ожидание запуска. Порядок: common → server → client → thin-client.";
       const disks = (state.storages || []).filter((item) => item.role === "disk");
-      const row = (item, action) => `<div style="display:flex;justify-content:space-between;gap:12px;padding:10px 0;border-bottom:1px solid var(--line)"><span>${esc(item.name)}<br><span class="mono muted">${esc(item.detail || item.host || item.endpoint || "")}</span></span><button class="ghost" type="button" data-drop="${action}:${esc(item.id)}">Удалить</button></div>`;
-      const storageRow = (item) => `<div style="display:flex;justify-content:space-between;gap:12px;padding:10px 0;border-bottom:1px solid var(--line)"><span>${esc(item.name)}<br><span class="mono muted">${esc(item.detail || item.endpoint || "")}</span></span><span><button class="ghost" type="button" data-browse="${esc(item.id)}">Содержимое</button> <button class="ghost" type="button" data-drop="storages:${esc(item.id)}">Удалить</button></span></div>`;
+      const row = (item, action) => `<div style="display:flex;justify-content:space-between;gap:12px;padding:10px 0;border-bottom:1px solid var(--line)"><span>${esc(item.name)}<br><span class="mono muted">${esc(item.detail || item.host || item.endpoint || "")}</span></span><span><button class="ghost" type="button" data-edit-conn="${action}" data-id="${esc(item.id)}">Изменить</button> <button class="ghost" type="button" data-drop="${action}:${esc(item.id)}">Удалить</button></span></div>`;
+      const storageRow = (item) => `<div style="display:flex;justify-content:space-between;gap:12px;padding:10px 0;border-bottom:1px solid var(--line)"><span>${esc(item.name)}<br><span class="mono muted">${esc(item.detail || item.endpoint || "")}</span></span><span><button class="ghost" type="button" data-browse="${esc(item.id)}">Содержимое</button> <button class="ghost" type="button" data-edit-conn="storages" data-id="${esc(item.id)}">Изменить</button> <button class="ghost" type="button" data-drop="storages:${esc(item.id)}">Удалить</button></span></div>`;
       $("disk-list").innerHTML = disks.map(storageRow).join("") || "<p class='muted'>Пока ничего не подключено.</p>";
       $("cloud-list").innerHTML = (state.storages || []).filter((item) => item.role === "cloud").map(storageRow).join("") || "<p class='muted'>Пока ничего не подключено.</p>";
       const diskOptions = disks.map((item) => `<option value="${item.id}">${item.name}</option>`).join("");
@@ -460,10 +498,7 @@
         const details = active
           ? `<div class="meter" data-job-bar="${job.id}"><span style="width:${pct}%"></span></div><p class="muted" data-job-phase="${job.id}">${pct}% · ${esc(job.phase || (job.running ? "запуск" : ""))}</p><pre class="log" data-job-log="${job.id}" style="min-height:0">${esc(shown)}</pre>`
           : "";
-        const user = job.kind === "base"
-          ? `<label class="lbl">Пользователь базы</label><input data-base-login="${job.id}" value="${esc(job.baseLogin || "")}" placeholder="Пользователь информационной базы" /><label class="lbl">Пароль пользователя базы</label><input type="password" data-base-secret="${job.id}" placeholder="Пароль базы" /><button class="ghost" type="button" data-base-save="${job.id}">Сохранить пользователя базы</button>`
-          : "";
-        return `<div${job.running ? ' data-live="1"' : ""}><p>${when} · ${place}${cloud} · хранить ${sched.keepDays ?? 14} дн. <button class="ghost" type="button" data-run="${job.id}">${job.running ? "Идёт…" : "Запустить"}</button> <button class="ghost" type="button" data-drop="backup-jobs:${job.id}">Удалить</button></p><div class="stack">${user}</div>${details}</div>`;
+        return `<div${job.running ? ' data-live="1"' : ""}><p>${when} · ${place}${cloud} · хранить ${sched.keepDays ?? 14} дн. <button class="ghost" type="button" data-edit-job="${job.id}">Изменить</button> <button class="ghost" type="button" data-run="${job.id}">${job.running ? "Идёт…" : "Запустить"}</button> <button class="ghost" type="button" data-drop="backup-jobs:${job.id}">Удалить</button></p>${details}</div>`;
       };
       const jobForm = (id, kind) => {
         const dayButtons = days.map((label, index) => `<button class="ghost" type="button" data-day="${index}" data-day-for="${id}" data-on="${index < 5 ? "1" : "0"}" style="${index < 5 ? "background:var(--pine);color:#fff" : ""}">${label}</button>`).join("");
@@ -492,6 +527,17 @@
         const windows = `<label class="lbl">Логин Windows для диска C:</label><input data-win-login="${esc(item.id)}" value="${esc(item.fileLogin || "")}" placeholder="Администратор или ДОМЕН\\user" /><label class="lbl">Пароль Windows</label><input type="password" data-win-secret="${esc(item.id)}" placeholder="Пароль Windows" /><button class="dark" type="button" data-win-save="${esc(item.id)}">Сохранить доступ к диску</button>`;
         return `${row(item, "sql")}<p class="mono muted">${esc(item.host)}:${esc(item.port || "1433")}</p><div class="stack">${windows}<button class="ghost" type="button" data-catalog="sql" data-id="${item.id}">Обновить список</button><select data-pick="${item.id}">${options}</select><button class="dark" type="button" data-take="sql" data-source="${item.id}">Взять в работу</button></div>${problem}${chosen}`;
       }).join("") || "<p class='muted'>Серверы SQL не подключены.</p>";
+      const copiesHtml = (kind) => {
+        const rows = (state.copies || []).filter((item) => item.kind === kind);
+        if (!rows.length) return "<p class='muted'>Готовых копий пока нет.</p>";
+        return rows.map((item) => {
+          const log = (item.lastLog || []).join("\n");
+          return `<div${item.running ? ' data-live="1"' : ""} style="padding:10px 0;border-bottom:1px solid var(--line)"><p><b>${esc(item.name)}</b> · ${esc(item.created || item.stamp || "")} · ${esc(item.storageName || "")}</p><p><button class="ghost" type="button" data-restore="${esc(item.id)}">${item.running ? "Идёт…" : "Восстановить"}</button> <button class="ghost" type="button" data-drop="copies:${esc(item.id)}">Убрать из списка</button></p>${log ? `<pre class="log" data-copy-log="${esc(item.id)}" style="min-height:0">${esc(log)}</pre>` : ""}</div>`;
+        }).join("");
+      };
+      if ($("base-copies")) $("base-copies").innerHTML = "<strong>Готовые копии</strong>" + copiesHtml("base");
+      if ($("sql-copies")) $("sql-copies").innerHTML = "<strong>Готовые копии</strong>" + copiesHtml("sql");
+      if ($("vm-copies")) $("vm-copies").innerHTML = "<strong>Готовые копии</strong>" + copiesHtml("vm");
       $("users").innerHTML = state.users.map((user) => {
         const self = user.login === state.me.login;
         const blocked = user.blocked ? "1" : "0";
@@ -944,6 +990,15 @@
           const node = document.querySelector(`[data-job-log="${job.id}"]`);
           if (node && node.closest("[data-live]") && !job.running) finished = true;
         }
+        for (const copy of state.copies || []) {
+          const box = document.querySelector(`[data-copy-log="${copy.id}"]`);
+          const text = (copy.lastLog || []).join("\n");
+          if (box && box.textContent !== text) {
+            box.textContent = text;
+            box.scrollTop = box.scrollHeight;
+          }
+          if (box && box.closest("[data-live]") && !copy.running) finished = true;
+        }
         if (finished) await refresh();
       } catch { /* сеть */ }
     }, 1000);
@@ -1021,6 +1076,106 @@
         $("browse-rows").textContent = error.message;
       }
     }
+
+    function closeEditor() {
+      editor = null;
+      $("editor").classList.add("hidden");
+    }
+
+    function openJobEditor(job) {
+      const state = viewState || { storages: [] };
+      const disks = (state.storages || []).filter((item) => item.role === "disk");
+      const clouds = (state.storages || []).filter((item) => item.role === "cloud");
+      const sched = job.schedule || {};
+      const days = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"];
+      const selected = sched.days || [];
+      const dayButtons = days.map((label, index) => {
+        const on = selected.includes(index);
+        return `<button class="ghost" type="button" data-day="${index}" data-day-for="editor" data-on="${on ? "1" : "0"}" style="${on ? "background:var(--pine);color:#fff" : ""}">${label}</button>`;
+      }).join("");
+      const diskOptions = disks.map((item) => `<option value="${esc(item.id)}"${item.id === job.storageId ? " selected" : ""}>${esc(item.name)}</option>`).join("");
+      const cloud = clouds.map((item) => `<label><input type="checkbox" data-edit-cloud value="${esc(item.id)}"${(job.copyIds || []).includes(item.id) ? " checked" : ""}> ${esc(item.name)}</label>`).join(" ");
+      const base = job.kind === "base"
+        ? `<label class="lbl">Пользователь базы</label><input id="edit-base-login" value="${esc(job.baseLogin || "")}" placeholder="Пользователь информационной базы" /><label class="lbl">Пароль пользователя базы</label><input id="edit-base-secret" type="password" placeholder="Пусто — не менять" />`
+        : "";
+      $("editor-title").textContent = "Бекап";
+      $("editor-fields").innerHTML = `<label class="lbl">Хранилище</label><select id="edit-disk">${diskOptions}</select><label class="lbl">Папка</label><input id="edit-folder" value="${esc(job.folder || "")}" /><label><input id="edit-sched" type="checkbox"${sched.enabled ? " checked" : ""}> По расписанию</label><div>${dayButtons}</div><label class="lbl">Время</label><input id="edit-time" type="time" value="${esc(sched.time || "02:00")}" /><label class="lbl">Хранить, дней</label><input id="edit-keep" type="number" min="0" value="${Number(sched.keepDays ?? 14)}" />${cloud ? `<div>${cloud}</div><label class="lbl">Папка в облаке</label><input id="edit-cloud-folder" value="${esc(job.cloudFolder || "")}" />` : ""}${base}`;
+      editor = { mode: "job", id: job.id };
+      $("editor").classList.remove("hidden");
+    }
+
+    function openConnEditor(kind, item) {
+      const fields = [];
+      const add = (id, label, value, type) => {
+        const password = type === "password";
+        fields.push(`<label class="lbl">${label}</label><input id="${id}" type="${password ? "password" : "text"}" value="${password ? "" : esc(value || "")}" placeholder="${password ? "Пусто — не менять" : ""}" />`);
+      };
+      add("edit-name", "Имя", item.name);
+      if (kind === "hosts" || kind === "storages") {
+        const options = kind === "hosts"
+          ? [["esxi", "ESXi"], ["vsphere", "vSphere"]]
+          : [["webdav", "WebDAV"], ["cifs", "CIFS"], ["nfs", "NFS"], ["ftp", "FTP"], ["google", "Google Drive"], ["yandex", "Яндекс Диск"], ["mail", "Mail.ru"]];
+        fields.push(`<label class="lbl">Тип</label><select id="edit-kind">${options.map(([value, label]) => `<option value="${value}"${item.kind === value ? " selected" : ""}>${label}</option>`).join("")}</select>`);
+      }
+      if (kind === "storages") add("edit-endpoint", "Адрес", item.endpoint);
+      else add("edit-host", "Адрес", item.host);
+      if (kind === "clusters" || kind === "sql") add("edit-port", "Порт", item.port || (kind === "sql" ? "1433" : "1545"));
+      add("edit-login", "Логин", item.login);
+      add("edit-secret", "Пароль", "", "password");
+      if (kind === "sql") {
+        add("edit-file-login", "Логин Windows для диска C:", item.fileLogin);
+        add("edit-file-secret", "Пароль Windows", "", "password");
+      }
+      $("editor-title").textContent = "Подключение";
+      $("editor-fields").innerHTML = fields.join("");
+      editor = { mode: "conn", kind, id: item.id };
+      $("editor").classList.remove("hidden");
+    }
+
+    $("editor-form").addEventListener("submit", async (event) => {
+      event.preventDefault();
+      if (!editor) return;
+      try {
+        if (editor.mode === "job") {
+          const days = [...document.querySelectorAll('[data-day-for="editor"]')].filter((item) => item.dataset.on === "1").map((item) => Number(item.dataset.day));
+          await send("/api/backup-jobs/edit", {
+            id: editor.id,
+            storageId: $("edit-disk") ? $("edit-disk").value : "",
+            folder: $("edit-folder") ? $("edit-folder").value : "",
+            cloudFolder: $("edit-cloud-folder") ? $("edit-cloud-folder").value : "",
+            copyIds: [...document.querySelectorAll("[data-edit-cloud]")].filter((item) => item.checked).map((item) => item.value),
+            baseLogin: $("edit-base-login") ? $("edit-base-login").value : "",
+            baseSecret: $("edit-base-secret") ? $("edit-base-secret").value : "",
+            schedule: {
+              enabled: Boolean($("edit-sched") && $("edit-sched").checked),
+              days,
+              time: $("edit-time") && $("edit-time").value ? $("edit-time").value : "02:00",
+              keepDays: Number($("edit-keep") && $("edit-keep").value) || 0
+            }
+          });
+        } else {
+          const body = { list: editor.kind, id: editor.id };
+          const take = (id, key) => {
+            const node = $(id);
+            if (node && node.value) body[key] = node.value;
+          };
+          take("edit-name", "name");
+          take("edit-host", "host");
+          take("edit-endpoint", "endpoint");
+          take("edit-port", "port");
+          take("edit-login", "login");
+          take("edit-secret", "secret");
+          take("edit-kind", "kind");
+          take("edit-file-login", "fileLogin");
+          take("edit-file-secret", "fileSecret");
+          await send("/api/connections/edit", body);
+        }
+        closeEditor();
+        await refresh();
+      } catch (error) {
+        $("form-error").textContent = error.message;
+      }
+    });
 
     document.body.addEventListener("click", async (event) => {
       const opened = event.target.dataset.browse;
@@ -1123,6 +1278,37 @@
           });
           await refresh();
         } catch { /* shown */ }
+        return;
+      }
+      const editJob = event.target.closest("[data-edit-job]");
+      if (editJob) {
+        event.preventDefault();
+        const job = ((viewState || {}).backupJobs || []).find((item) => item.id === editJob.dataset.editJob);
+        if (job) openJobEditor(job);
+        return;
+      }
+      const editConn = event.target.closest("[data-edit-conn]");
+      if (editConn) {
+        event.preventDefault();
+        const lists = { hosts: "hosts", clusters: "clusters", sql: "sqlServers", storages: "storages" };
+        const item = (((viewState || {})[lists[editConn.dataset.editConn]]) || []).find((row) => row.id === editConn.dataset.id);
+        if (item) openConnEditor(editConn.dataset.editConn, item);
+        return;
+      }
+      const restore = event.target.closest("[data-restore]");
+      if (restore) {
+        event.preventDefault();
+        if (!window.confirm("Восстановление заменит текущие данные. Продолжить?")) return;
+        try {
+          await send("/api/copies/restore", { id: restore.dataset.restore });
+          await refresh();
+        } catch (error) {
+          $("form-error").textContent = error.message;
+        }
+        return;
+      }
+      if (event.target.id === "editor-close") {
+        closeEditor();
         return;
       }
       const baseSave = event.target.closest("[data-base-save]");

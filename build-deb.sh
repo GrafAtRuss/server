@@ -2,7 +2,7 @@
 set -eu
 ROOT=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
 STAGE=$(mktemp -d)
-VERSION=1.2.25
+VERSION=1.2.26
 NAME=onec-console
 DEST="$STAGE/${NAME}_${VERSION}_all"
 OUT=${1:-$ROOT/${NAME}_${VERSION}_all.deb}

@@ -585,7 +585,7 @@ def connect_host(host: dict):
     kind = host.get("kind") or ""
     try:
         session, root = vsphere_login(base, host.get("login", ""), host.get("secret", ""), kind)
-        return RestHost(base, root, session)
+        return RestHost(base, root, session, str(host.get("login", "")), str(host.get("secret", "")), kind)
     except RuntimeError as error:
         rest_error = str(error)
     try:
@@ -604,10 +604,13 @@ def connect_host(host: dict):
 
 
 class RestHost:
-    def __init__(self, base: str, root: str, session: str):
+    def __init__(self, base: str, root: str, session: str, login: str = "", secret: str = "", kind: str = ""):
         self.base = base
         self.root = root
         self.session = session
+        self.login = login
+        self.secret = secret
+        self.kind = kind
         self.vm_id = ""
 
     def names(self) -> list:
@@ -617,13 +620,36 @@ class RestHost:
 
     def shutdown(self, name: str) -> None:
         self.vm_id = find_vm(self.base, self.root, self.session, name)
-        api(self.base, self.root, self.session, f"/vcenter/vm/{self.vm_id}/guest/power?action=shutdown", method="POST")
+        api(self.base, self.root, self.session, f"/vcenter/vm/{urllib.parse.quote(self.vm_id, safe='')}/guest/power?action=shutdown", method="POST")
 
     def wait_off(self, name: str) -> bool:
         return wait_off(self.base, self.root, self.session, self.vm_id)
 
     def power_on(self, name: str) -> None:
-        api(self.base, self.root, self.session, f"/vcenter/vm/{self.vm_id}/power?action=start", method="POST")
+        try:
+            self.vm_id = find_vm(self.base, self.root, self.session, name)
+        except Exception:
+            if not self.vm_id:
+                raise
+        encoded = urllib.parse.quote(self.vm_id, safe="")
+        last = ""
+        for path in (
+            f"/vcenter/vm/{encoded}/power/start",
+            f"/vcenter/vm/{encoded}/power?action=start",
+        ):
+            try:
+                api(self.base, self.root, self.session, path, method="POST")
+                return
+            except RuntimeError as error:
+                last = str(error)
+                if "404" not in last and "Not found" not in last and "httpNotFound" not in last:
+                    break
+        try:
+            soap = SoapHost.login(self.base, self.login, self.secret, self.kind)
+            soap.power_on(name)
+            return
+        except Exception as error:
+            raise RuntimeError(f"{last}. Включение через SOAP: {error}") from error
 
 
 class SoapHost:
@@ -1039,3 +1065,70 @@ def schedule_due(schedule: dict, now: datetime, last_slot: str) -> bool:
     if last_slot == slot or now.strftime("%H:%M") != schedule.get("time"):
         return False
     return now.weekday() in schedule.get("days", [])
+
+
+def cache_root() -> Path:
+    return Path(os.environ.get("ONEC_CACHE_DIR", "/var/cache/onec-platform"))
+
+
+def locate_copy(storage: dict, rel: str) -> Path:
+    rel = clean_rel(rel)
+    stage = (cache_root() / "stage" / storage["id"] / rel).resolve()
+    if stage.is_dir() and any(stage.iterdir()):
+        return stage
+    if storage.get("kind") in ("cifs", "nfs"):
+        ok, detail = mount_disk(storage)
+        if not ok:
+            raise RuntimeError(detail)
+        path = (MOUNT_ROOT / storage["id"] / rel).resolve()
+        if not path.is_dir() or not any(path.iterdir()):
+            raise RuntimeError("копия на диске не найдена")
+        return path
+    dest = (cache_root() / "restore" / storage["id"] / rel).resolve()
+    dest.mkdir(parents=True, exist_ok=True)
+    listing = list_storage(storage, rel)
+    for row in listing.get("entries") or []:
+        if row.get("kind") != "file" or not row.get("name"):
+            continue
+        download_file(storage, f"{rel}/{row['name']}".strip("/"), dest / row["name"])
+    if not any(dest.iterdir()):
+        raise RuntimeError("в хранилище нет файлов этой копии")
+    return dest
+
+
+def download_file(storage: dict, rel: str, dest: Path) -> None:
+    kind = storage.get("kind")
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if kind == "ftp":
+        import ftplib
+
+        host, port = split_host(storage["endpoint"], 21)
+        ftp = ftplib.FTP()
+        ftp.connect(host, port, timeout=60)
+        ftp.login(storage.get("login") or "anonymous", storage.get("secret") or "anonymous@")
+        root = ftp_dir(storage["endpoint"]).rstrip("/")
+        with dest.open("wb") as handle:
+            ftp.retrbinary(f"RETR {root}/{rel}", handle.write)
+        ftp.quit()
+        return
+    if kind in ("webdav", "mail"):
+        request = urllib.request.Request(join_url(webdav_base(storage), rel))
+        webdav_auth(request, storage)
+        with urllib.request.urlopen(request, timeout=120, context=CTX) as response:
+            dest.write_bytes(response.read())
+        return
+    if kind == "yandex":
+        disk = yandex_root(storage.get("endpoint", "")).rstrip("/") + "/" + rel
+        query = urllib.parse.urlencode({"path": disk})
+        request = urllib.request.Request(
+            "https://cloud-api.yandex.net/v1/disk/resources/download?" + query,
+            headers={"Authorization": f"OAuth {storage.get('secret', '')}"},
+        )
+        with urllib.request.urlopen(request, timeout=30) as response:
+            href = json.loads(response.read().decode()).get("href")
+        if not href:
+            raise RuntimeError("Яндекс Диск не дал ссылку на файл")
+        with urllib.request.urlopen(href, timeout=120) as response:
+            dest.write_bytes(response.read())
+        return
+    raise RuntimeError("скачать копию из этого хранилища нельзя, файл уже удалён с этой машины")
