@@ -428,33 +428,171 @@ def run_vm(job: dict, host: dict, storage: dict, step=None) -> list:
     return log
 
 
+def ssh_host(host: dict) -> str:
+    login = str(host.get("login", ""))
+    address = str(host.get("host", "")).split("://")[-1].split("/")[0].split(":")[0]
+    return f"{login}@{address}"
+
+
+def shell_quote(value: str) -> str:
+    return "'" + str(value).replace("'", "'\\''") + "'"
+
+
+def ssh_exec(host: dict, command: str, timeout: int = 60, stdout=None, stdin=None):
+    return subprocess.run(
+        [
+            "sshpass", "-p", str(host.get("secret", "")),
+            "ssh", "-o", "StrictHostKeyChecking=accept-new",
+            "-o", "PreferredAuthentications=password",
+            ssh_host(host),
+            command,
+        ],
+        stdout=stdout if stdout is not None else subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        stdin=stdin,
+        check=False,
+        timeout=timeout,
+    )
+
+
+def ssh_text(host: dict, command: str, timeout: int = 60) -> tuple[int, str, str]:
+    result = ssh_exec(host, command, timeout=timeout)
+    out = (result.stdout or b"").decode("utf-8", "replace")
+    err = (result.stderr or b"").decode("utf-8", "replace")
+    return result.returncode, out, err
+
+
+def vmx_directory(vmx: str) -> str:
+    text = vmx.strip()
+    if text.startswith("[") and "]" in text:
+        store, rest = text[1:].split("]", 1)
+        parent = str(Path(rest.strip()).parent)
+        suffix = "" if parent in ("", ".") else "/" + parent
+        return f"/vmfs/volumes/{store.strip()}{suffix}"
+    return str(Path(text).parent)
+
+
+def looks_like_tar(path: Path) -> bool:
+    if not path.is_file() or path.stat().st_size < 512:
+        return False
+    head = path.read_bytes()[:200]
+    if head.startswith(b"Unknown command") or b"Unknown command" in head:
+        return False
+    return True
+
+
+def locate_vm_dir(host: dict, vm_name: str) -> str:
+    safe = vm_name.replace("'", "")
+    code, out, err = ssh_text(host, "/bin/sh -c 'vim-cmd vmsvc/getallvms'")
+    if code != 0 or ("Unknown command" in (err + out)):
+        code, out, err = ssh_text(host, "vim-cmd vmsvc/getallvms")
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) < 3 or parts[0] == "Vmid" or ".vmx" not in line:
+            continue
+        if parts[1] == safe or f" {vm_name} " in f" {line} ":
+            start = line.find("[")
+            end = line.find(".vmx")
+            if start >= 0 and end > start:
+                return vmx_directory(line[start:end + 4].strip())
+    detail = (err or out).strip()[:200]
+    raise RuntimeError("каталог ВМ на ESXi не найден" + (f": {detail}" if detail else ""))
+
+
 def copy_vm_files(host: dict, vm_name: str, folder: Path) -> str:
     if not shutil_which("sshpass"):
         return "файлы ВМ не скопированы: нет sshpass, метка бекапа записана"
-    target = f"{host['login']}@{host['host'].split('://')[-1].split('/')[0]}"
-    remote = f"vim-cmd vmsvc/getallvms | awk -F '  +' -v n='{vm_name}' '$2==n {{print $4}}'"
-    result = subprocess.run(
-        ["sshpass", "-p", host["secret"], "ssh", "-o", "StrictHostKeyChecking=accept-new", target, remote],
-        text=True,
-        capture_output=True,
-        check=False,
-        timeout=40,
-    )
-    vmx = (result.stdout or "").strip().splitlines()
-    if result.returncode != 0 or not vmx:
-        return "каталог ВМ на ESXi не найден, метка бекапа записана"
-    directory = str(Path(vmx[0]).parent)
+    try:
+        directory = locate_vm_dir(host, vm_name)
+    except RuntimeError as error:
+        return str(error)
+    quoted = shell_quote(directory)
     archive = folder / "vm.tar"
-    stream = subprocess.run(
-        ["sshpass", "-p", host["secret"], "ssh", "-o", "StrictHostKeyChecking=accept-new", target, "tar", "-C", directory, "-cf", "-", "."],
-        stdout=archive.open("wb"),
-        stderr=subprocess.PIPE,
-        check=False,
-        timeout=3600,
+    last = ""
+    for command in (
+        f"/bin/sh -c 'cd {quoted} && /bin/tar -cf - .'",
+        f"/bin/sh -c 'cd {quoted} && tar -cf - .'",
+        f"/bin/sh -c 'cd {quoted} && busybox tar -cf - .'",
+    ):
+        with archive.open("wb") as handle:
+            result = ssh_exec(host, command, timeout=3600, stdout=handle)
+        last = (result.stderr or b"").decode("utf-8", "replace").strip()[:300]
+        if result.returncode == 0 and looks_like_tar(archive):
+            return f"файлы ВМ записаны в {archive}"
+    built = copy_vm_by_files(host, directory, archive)
+    if built:
+        return f"файлы ВМ записаны в {archive}"
+    if archive.exists():
+        archive.unlink()
+    return "копия файлов ВМ не удалась: " + (last or "на гипервизоре нет команды tar")
+
+
+def copy_vm_by_files(host: dict, directory: str, archive: Path) -> bool:
+    quoted = shell_quote(directory)
+    code, out, _ = ssh_text(host, f"/bin/sh -c 'cd {quoted} && find . -type f'", timeout=120)
+    names = [line.strip() for line in out.splitlines() if line.startswith("./") or (line.startswith(".") and line not in (".", ".."))]
+    if code != 0 or not names:
+        return False
+    import tarfile
+
+    with tarfile.open(archive, "w") as bundle:
+        for name in names:
+            remote = directory.rstrip("/") + "/" + name[2:] if name.startswith("./") else directory.rstrip("/") + "/" + name
+            size_code, size_out, _ = ssh_text(host, f"/bin/sh -c 'wc -c < {shell_quote(remote)}'", timeout=60)
+            digits = "".join(char for char in size_out if char.isdigit())
+            if size_code != 0 or not digits:
+                continue
+            info = tarfile.TarInfo(name[2:] if name.startswith("./") else name)
+            info.size = int(digits)
+            proc = subprocess.Popen(
+                [
+                    "sshpass", "-p", str(host.get("secret", "")),
+                    "ssh", "-o", "StrictHostKeyChecking=accept-new",
+                    ssh_host(host),
+                    f"/bin/sh -c 'cat {shell_quote(remote)}'",
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            bundle.addfile(info, proc.stdout)
+            proc.wait(timeout=3600)
+            if proc.returncode != 0:
+                continue
+    return looks_like_tar(archive)
+
+
+def extract_vm_files(host: dict, directory: str, archive: Path) -> None:
+    quoted = shell_quote(directory)
+    attempts = (
+        f"/bin/sh -c 'cd {quoted} && /bin/tar -xf -'",
+        f"/bin/sh -c 'cd {quoted} && tar -xf -'",
+        f"/bin/sh -c 'cd {quoted} && busybox tar -xf -'",
     )
-    if stream.returncode != 0:
-        return "копия файлов ВМ не удалась"
-    return f"файлы ВМ записаны в {archive}"
+    last = ""
+    for command in attempts:
+        with archive.open("rb") as handle:
+            result = ssh_exec(host, command, timeout=3600, stdin=handle)
+        last = (result.stderr or b"").decode("utf-8", "replace").strip()[:300]
+        if result.returncode == 0 and "Unknown command" not in last:
+            return
+    import tarfile
+
+    with tarfile.open(archive, "r") as bundle:
+        for member in bundle.getmembers():
+            if not member.isfile():
+                continue
+            remote = directory.rstrip("/") + "/" + member.name
+            payload = bundle.extractfile(member)
+            if payload is None:
+                continue
+            result = ssh_exec(host, f"/bin/sh -c 'cat > {shell_quote(remote)}'", timeout=3600, stdin=payload)
+            if result.returncode != 0:
+                detail = (result.stderr or b"").decode("utf-8", "replace").strip()[:200]
+                raise RuntimeError(detail or f"не записан {member.name}")
+    if last and "Unknown command" in last:
+        return
+    if last:
+        raise RuntimeError(last)
 
 
 def shutil_which(name: str):

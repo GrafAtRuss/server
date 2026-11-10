@@ -38,9 +38,9 @@ from hostadmin import (
     ensure_soname,
     apt_install,
 )
-from ops import MOUNT_ROOT, cache_root, connect_host, deliver, locate_copy, list_storage, probe, public_copy, run_vm, schedule_due
+from ops import MOUNT_ROOT, cache_root, connect_host, deliver, extract_vm_files, locate_copy, locate_vm_dir, list_storage, probe, public_copy, run_vm, schedule_due
 
-PRODUCT_VERSION = "1.2.27"
+PRODUCT_VERSION = "1.2.28"
 LOGIN_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
 
 STATE_DIR = Path(os.environ.get("ONEC_STATE_DIR", "/var/lib/onec-console"))
@@ -1462,32 +1462,9 @@ def restore_vm_files(host: dict, name: str, folder: Path, note) -> None:
     if not control.wait_off(name):
         raise RuntimeError("машина не выключилась")
     try:
-        if shutil.which("sshpass") is None:
-            raise RuntimeError("нет sshpass, файлы вернуть нельзя")
-        target = f"{host['login']}@{str(host['host']).split('://')[-1].split('/')[0]}"
-        safe = name.replace("'", "")
-        remote = f"vim-cmd vmsvc/getallvms | awk -F '  +' -v n='{safe}' '$2==n {{print $4}}'"
-        result = subprocess.run(
-            ["sshpass", "-p", host["secret"], "ssh", "-o", "StrictHostKeyChecking=accept-new", target, remote],
-            text=True,
-            capture_output=True,
-            timeout=40,
-            check=False,
-        )
-        vmx = (result.stdout or "").strip().splitlines()
-        if result.returncode != 0 or not vmx:
-            raise RuntimeError("каталог ВМ на ESXi не найден")
-        directory = str(Path(vmx[0]).parent)
+        directory = locate_vm_dir(host, name)
         note(f"возвращаю файлы в {directory}")
-        stream = subprocess.run(
-            ["sshpass", "-p", host["secret"], "ssh", "-o", "StrictHostKeyChecking=accept-new", target, "tar", "-C", directory, "-xf", "-"],
-            stdin=archive.open("rb"),
-            stderr=subprocess.PIPE,
-            timeout=3600,
-            check=False,
-        )
-        if stream.returncode != 0:
-            raise RuntimeError((stream.stderr or b"").decode("utf-8", "replace")[:400] or "tar не записал файлы")
+        extract_vm_files(host, directory, archive)
     finally:
         control.power_on(name)
         note("машина включается")
