@@ -406,7 +406,7 @@ def run_vm(job: dict, host: dict, storage: dict, step=None) -> list:
             note_path = stamp_dir / "backup.txt"
             note_path.write_text(f"{job['vmName']} off, host {host['host']}\n", encoding="utf-8")
             note(65, "копирование файлов", f"отметка бекапа {note_path}")
-            copied = copy_vm_files(host, job["vmName"], stamp_dir, control, lambda line: note(70, "копирование файлов", line))
+            copied = copy_vm_files(host, job["vmName"], stamp_dir, control, lambda line: note(70, "копирование файлов", line), storage)
             if str(copied).startswith("файлы ВМ записаны"):
                 note(80, "копирование файлов", copied)
             else:
@@ -528,7 +528,7 @@ def parse_ds_path(path: str) -> tuple[str, str]:
     return store.strip(), folder
 
 
-def copy_vm_files(host: dict, vm_name: str, folder: Path, control=None, progress=None) -> str:
+def copy_vm_files(host: dict, vm_name: str, folder: Path, control=None, progress=None, storage=None) -> str:
     if shutil_which("sshpass"):
         try:
             directory = locate_vm_dir(host, vm_name)
@@ -544,7 +544,7 @@ def copy_vm_files(host: dict, vm_name: str, folder: Path, control=None, progress
                 progress(copied)
     if progress:
         progress("это vCenter, скачиваю файлы машины через API")
-    return download_vm_http(host, vm_name, folder, control, progress)
+    return download_vm_http(host, vm_name, folder, control, progress, storage)
 
 
 def copy_vm_ssh(host: dict, directory: str, folder: Path) -> str:
@@ -569,8 +569,7 @@ def copy_vm_ssh(host: dict, directory: str, folder: Path) -> str:
     return "копия файлов ВМ не удалась: " + (last or "на гипервизоре нет команды tar")
 
 
-def download_vm_http(host: dict, vm_name: str, folder: Path, control=None, progress=None) -> str:
-    import tarfile
+def download_vm_http(host: dict, vm_name: str, folder: Path, control=None, progress=None, storage=None) -> str:
     from html import unescape
 
     if control is None:
@@ -613,44 +612,71 @@ def download_vm_http(host: dict, vm_name: str, folder: Path, control=None, progr
         last = "каталог пуст или это не список файлов"
     if not names:
         return f"файлы {vm_name} в хранилище {datastore} не открылись: {last}"
+    names.sort(key=lambda item: (item.endswith(".vmdk"), item.lower()))
     (folder / "vm-source.txt").write_text(
         f"datastore={datastore}\nfolder={remote_folder}\ndc={chosen}\npath={vmdk}\n",
         encoding="utf-8",
     )
-    archive = folder / "vm.tar"
-    with tarfile.open(archive, "w") as bundle:
-        for name in names:
-            if progress:
-                progress(f"скачиваю {name}")
-            remote = f"{remote_folder}/{name}" if remote_folder else name
-            url = folder_url(base, datastore, chosen, remote)
-            conn, response = http_open(url, folder_headers(host, cookie), timeout=3600)
+    saved = []
+    remote_copy = storage_rel(storage, folder) if storage else ""
+    kind = (storage or {}).get("kind")
+    uploaded = (not storage) or kind in ("cifs", "nfs") or bool(remote_copy)
+    for name in names:
+        if progress:
+            progress(f"скачиваю {name}")
+        remote = f"{remote_folder}/{name}" if remote_folder else name
+        url = folder_url(base, datastore, chosen, remote)
+        dest = folder / name
+        conn, response = http_open(url, folder_headers(host, cookie), timeout=300)
+        try:
+            if response.status >= 400:
+                body = response.read(300).decode("utf-8", "replace")
+                raise RuntimeError(f"{name}: HTTP {response.status} {body}")
+            total = int(response.getheader("Content-Length") or "0")
+            got = 0
+            stamp = time.time()
+            with dest.open("wb") as handle:
+                while True:
+                    chunk = response.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    handle.write(chunk)
+                    got += len(chunk)
+                    now = time.time()
+                    if progress and now - stamp >= 5:
+                        stamp = now
+                        if total:
+                            progress(f"{name}: {got // 1048576} МБ из {total // 1048576}")
+                        else:
+                            progress(f"{name}: {got // 1048576} МБ")
+        finally:
+            conn.close()
+        if got < 64:
+            head = dest.read_bytes()[:80]
+            if b"<html" in head.lower() or b"<!doctype" in head.lower() or b"Unauthorized" in head:
+                dest.unlink(missing_ok=True)
+                raise RuntimeError(f"{name}: vCenter вернул страницу вместо файла")
+        if total and got < total:
+            dest.unlink(missing_ok=True)
+            raise RuntimeError(f"{name}: связь оборвалась, получено {got // 1048576} МБ из {total // 1048576}")
+        saved.append(name)
+        if storage and remote_copy and storage.get("kind") not in ("cifs", "nfs"):
             try:
-                if response.status >= 400:
-                    body = response.read(300).decode("utf-8", "replace")
-                    raise RuntimeError(f"{name}: HTTP {response.status} {body}")
-                length = int(response.getheader("Content-Length") or "0")
-                info = tarfile.TarInfo(name)
-                if length > 0:
-                    info.size = length
-                    bundle.addfile(info, response)
-                else:
-                    temp = folder / f".part-{safe_name(name)}"
-                    with temp.open("wb") as handle:
-                        while True:
-                            chunk = response.read(1024 * 1024)
-                            if not chunk:
-                                break
-                            handle.write(chunk)
-                    info.size = temp.stat().st_size
-                    with temp.open("rb") as handle:
-                        bundle.addfile(info, handle)
-                    temp.unlink(missing_ok=True)
-            finally:
-                conn.close()
-    if not looks_like_tar(archive):
-        return "файлы скачались, но архив пуст"
-    return f"файлы ВМ записаны в {archive}"
+                note = deliver_file(storage, remote_copy, dest)
+                if progress:
+                    progress(note)
+            except Exception as error:
+                uploaded = False
+                if progress:
+                    progress(f"{name} не ушёл в хранилище: {error}")
+        elif storage and storage.get("kind") in ("cifs", "nfs"):
+            if progress:
+                progress(f"{name} записан на диск")
+    if not saved:
+        return "файлы машины не скачались"
+    if uploaded:
+        (folder / ".uploaded").write_text("1", encoding="utf-8")
+    return f"файлы ВМ записаны в {folder}: " + ", ".join(saved)
 
 
 def soap_vm_path(host: dict, vm_name: str, control=None) -> str:
@@ -768,23 +794,33 @@ def http_open(url: str, headers: dict, method: str = "GET", timeout: int = 120):
     raise RuntimeError("слишком много перенаправлений")
 
 
-def upload_vm_http(host: dict, archive: Path, meta_file: Path) -> None:
-    import tarfile
-
+def read_vm_meta(meta_file: Path) -> dict:
     meta = {}
     for line in meta_file.read_text(encoding="utf-8").splitlines():
         if "=" in line:
             key, value = line.split("=", 1)
             meta[key] = value
-    datastore = meta.get("datastore", "")
-    remote_folder = meta.get("folder", "")
-    datacenter = meta.get("dc", "") or "Datacenter"
-    if not datastore:
+    if not meta.get("datastore"):
         raise RuntimeError("в копии нет пути хранилища vCenter")
+    return meta
+
+
+def upload_vm_http(host: dict, archive: Path, meta_file: Path) -> None:
+    import tarfile
+
+    meta = read_vm_meta(meta_file)
     control = connect_host(host)
     base = getattr(control, "base", "") or api_base(host.get("host", ""))
     cookie = folder_cookie(host, control)
     headers = folder_headers(host, cookie)
+    datacenter = meta.get("dc") or "Datacenter"
+    files = [path for path in meta_file.parent.iterdir() if path.is_file() and path.suffix.lower() in {".vmdk", ".vmx", ".nvram", ".vmsd"}]
+    if files:
+        for local in files:
+            remote = f"{meta.get('folder', '')}/{local.name}".strip("/")
+            with local.open("rb") as handle:
+                put_stream(folder_url(base, meta["datastore"], datacenter, remote), headers, handle, local.stat().st_size)
+        return
     with tarfile.open(archive, "r") as bundle:
         for member in bundle.getmembers():
             if not member.isfile():
@@ -792,14 +828,16 @@ def upload_vm_http(host: dict, archive: Path, meta_file: Path) -> None:
             payload = bundle.extractfile(member)
             if payload is None:
                 continue
-            remote = f"{remote_folder}/{member.name}" if remote_folder else member.name
-            url = folder_url(base, datastore, datacenter, remote)
-            put_stream(url, headers, payload, member.size)
+            remote = f"{meta.get('folder', '')}/{member.name}".strip("/")
+            put_stream(folder_url(base, meta["datastore"], datacenter, remote), headers, payload, member.size)
 
 
 def put_stream(url: str, headers: dict, payload, size: int) -> None:
     parts = urllib.parse.urlsplit(url)
-    conn = http.client.HTTPSConnection(parts.hostname, parts.port or 443, timeout=3600, context=CTX)
+    if parts.scheme == "https":
+        conn = http.client.HTTPSConnection(parts.hostname, parts.port or 443, timeout=7200, context=CTX)
+    else:
+        conn = http.client.HTTPConnection(parts.hostname, parts.port or 80, timeout=7200)
     path = parts.path or "/"
     if parts.query:
         path += "?" + parts.query
@@ -1420,6 +1458,68 @@ def wait_off(base: str, root: str, session: str, vm_id: str, seconds: int = 600,
 def safe_name(value: str) -> str:
     cleaned = "".join(char if char.isalnum() or char in "-_." else "_" for char in value)
     return cleaned or "vm"
+
+
+def storage_rel(storage: dict, stamp: Path) -> str:
+    try:
+        if storage.get("kind") in ("cifs", "nfs"):
+            root = (MOUNT_ROOT / storage["id"]).resolve()
+        else:
+            root = (cache_root() / "stage" / storage["id"]).resolve()
+        return stamp.resolve().relative_to(root).as_posix()
+    except (OSError, ValueError):
+        return ""
+
+
+def deliver_file(storage: dict, remote_dir: str, local: Path) -> str:
+    rel = f"{clean_rel(remote_dir)}/{local.name}".strip("/")
+    kind = storage.get("kind")
+    if kind == "ftp":
+        upload_ftp_file(storage, rel, local)
+    elif kind in ("webdav", "mail"):
+        upload_webdav_file(storage, rel, local)
+    elif kind in ("yandex", "google"):
+        upload_linked(storage, remote_dir, local)
+    else:
+        raise RuntimeError(f"неизвестный тип {kind}")
+    return f"{local.name} в хранилище {storage.get('name')} / {rel}"
+
+
+def upload_ftp_file(item: dict, remote: str, local: Path) -> None:
+    import ftplib
+
+    host, port = split_host(item["endpoint"], 21)
+    ftp = ftplib.FTP()
+    ftp.connect(host, port, timeout=7200)
+    ftp.login(item.get("login") or "anonymous", item.get("secret") or "anonymous@")
+    root = ftp_dir(item["endpoint"]).rstrip("/")
+    ftp_mkdirs(ftp, f"{root}/{remote}".rsplit("/", 1)[0])
+    with local.open("rb") as handle:
+        ftp.storbinary(f"STOR {root}/{remote}", handle, blocksize=1024 * 1024)
+    ftp.quit()
+
+
+def upload_webdav_file(item: dict, remote: str, local: Path) -> None:
+    webdav_mkcol(item, remote.rsplit("/", 1)[0])
+    url = join_url(webdav_base(item), remote)
+    token = b64encode(f"{item.get('login', '')}:{item.get('secret', '')}".encode()).decode()
+    with local.open("rb") as handle:
+        put_stream(url, {"Authorization": f"Basic {token}"}, handle, local.stat().st_size)
+
+
+def upload_linked(storage: dict, remote_dir: str, local: Path) -> None:
+    import tempfile
+
+    parent = Path(tempfile.mkdtemp(prefix="onec-vm-"))
+    link = parent / local.name
+    try:
+        os.link(local, link)
+    except OSError:
+        os.symlink(local, link)
+    if storage.get("kind") == "yandex":
+        upload_yandex_tree(storage, clean_rel(remote_dir), parent)
+    else:
+        upload_google_tree(storage, clean_rel(remote_dir), parent)
 
 
 def deliver(storage: dict, remote_folder: str, stamp: Path) -> str:

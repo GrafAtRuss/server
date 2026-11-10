@@ -40,7 +40,7 @@ from hostadmin import (
 )
 from ops import MOUNT_ROOT, cache_root, connect_host, deliver, extract_vm_files, locate_copy, locate_vm_dir, list_storage, probe, public_copy, run_vm, schedule_due, upload_vm_http
 
-PRODUCT_VERSION = "1.2.29"
+PRODUCT_VERSION = "1.2.30"
 LOGIN_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
 
 STATE_DIR = Path(os.environ.get("ONEC_STATE_DIR", "/var/lib/onec-console"))
@@ -1337,7 +1337,7 @@ def copy_rel(storage: dict, stamp: Path) -> str:
 def remember_copy(job: dict, storage: dict, stamp: Path, name: str, source_id: str) -> None:
     useful = [
         path for path in stamp.iterdir()
-        if path.is_file() and path.stat().st_size > 0 and path.suffix.lower() in {".cf", ".bak", ".tar"}
+        if path.is_file() and path.stat().st_size > 0 and path.suffix.lower() in {".cf", ".bak", ".tar", ".vmdk", ".vmx", ".nvram"}
     ]
     if not useful or not name:
         return
@@ -1569,7 +1569,9 @@ def perform_backup(state: dict, job: dict) -> list:
         return lines
     if stamp.is_dir() and any(stamp.iterdir()):
         progress(86, "сохраняю в хранилище", "переношу файлы в хранилище")
-        if storage.get("kind") not in ("cifs", "nfs"):
+        if (stamp / ".uploaded").is_file():
+            progress(90, "файлы в хранилище", "файлы уже в хранилище")
+        elif storage.get("kind") not in ("cifs", "nfs"):
             rel = copy_rel(storage, stamp)
             parent_rel = "" if rel == stamp.name else str(Path(rel).parent)
             progress(90, "сохраняю в хранилище", deliver(storage, parent_rel, stamp))
