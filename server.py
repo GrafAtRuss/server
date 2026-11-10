@@ -38,9 +38,9 @@ from hostadmin import (
     ensure_soname,
     apt_install,
 )
-from ops import MOUNT_ROOT, cache_root, connect_host, deliver, extract_vm_files, locate_copy, locate_vm_dir, list_storage, probe, public_copy, run_vm, schedule_due, upload_vm_http
+from ops import MOUNT_ROOT, Stopped, bind_job, cache_root, check_job, connect_host, deliver, extract_vm_files, job_stopped, kill_proc, locate_copy, locate_vm_dir, list_storage, probe, public_copy, run_vm, schedule_due, stop_job, track_proc, untrack_proc, upload_vm_http
 
-PRODUCT_VERSION = "1.2.30"
+PRODUCT_VERSION = "1.2.31"
 LOGIN_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
 
 STATE_DIR = Path(os.environ.get("ONEC_STATE_DIR", "/var/lib/onec-console"))
@@ -443,6 +443,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/backup-jobs/edit":
             self._edit_backup_job()
+            return
+        if path == "/api/backup-jobs/cancel":
+            self._cancel_backup_job()
             return
         if path == "/api/connections/edit":
             self._edit_connection()
@@ -1207,6 +1210,16 @@ class Handler(BaseHTTPRequestHandler):
             save_state(state)
         self._send(200, {"ok": True})
 
+    def _cancel_backup_job(self) -> None:
+        payload = self._read_json()
+        job_id = str(payload.get("id") or "")
+        if not job_id:
+            self._send(400, {"error": "Не указан бекап."})
+            return
+        stop_job(job_id)
+        push_progress(job_id, 99, "прерывание", "прерываю резервное копирование")
+        self._send(200, {"ok": True})
+
     def _restore_copy(self) -> None:
         payload = self._read_json()
         copy_id = payload.get("id")
@@ -1252,24 +1265,31 @@ class Handler(BaseHTTPRequestHandler):
                     item["lastLog"] = ["запущено"]
             save_state(fresh)
 
-        def work() -> None:
-            try:
-                log = perform_backup(state, job)
-            except Exception as error:
-                log = [stamp_line(str(error))]
-                push_progress(job["id"], 100, "ошибка", str(error))
-            with LOCK:
-                done = load_state()
-                for item in done["backupJobs"]:
-                    if item["id"] == job["id"]:
-                        item["running"] = False
-                        item["progress"] = 100
-                        item["phase"] = item.get("phase") or "готово"
-                        item["lastLog"] = log
-                save_state(done)
-
-        threading.Thread(target=work, daemon=True).start()
+        threading.Thread(target=work_backup, args=(state, job), daemon=True).start()
         self._send(200, {"log": ["запущено"]})
+
+
+def work_backup(state, job) -> None:
+    bind_job(job["id"])
+    log = None
+    try:
+        log = perform_backup(state, job)
+    except Stopped:
+        push_progress(job["id"], 100, "прервано", "резервное копирование прервано")
+    except Exception as error:
+        log = [stamp_line(str(error))]
+        push_progress(job["id"], 100, "ошибка", str(error))
+    with LOCK:
+        done = load_state()
+        for item in done["backupJobs"]:
+            if item["id"] == job["id"]:
+                item["running"] = False
+                item["progress"] = 100
+                if log is not None:
+                    item["lastLog"] = log
+                if item.get("phase") not in ("прервано", "ошибка"):
+                    item["phase"] = item.get("phase") or "готово"
+        save_state(done)
 
 
 def stamp_line(text: str) -> str:
@@ -1483,6 +1503,7 @@ def perform_backup(state: dict, job: dict) -> list:
     job_id = job.get("id", "")
 
     def progress(percent: int, phase: str, line: str = "") -> None:
+        check_job()
         if line:
             lines.append(stamp_line(line))
         push_progress(job_id, percent, phase, line)
@@ -1674,25 +1695,32 @@ def dump_config(binary: str, cluster: dict, target: str, stamp: Path, progress, 
                 command = ["xvfb-run", "-a", "-e", str(xvfb_file), *command]
                 progress(22, "виртуальный экран", "экран не найден, запускаю через xvfb")
         err_handle = err_file.open("w", encoding="utf-8")
-        proc = subprocess.Popen(command, stdout=err_handle, stderr=subprocess.STDOUT, text=True, env=env)
+        proc = subprocess.Popen(command, stdout=err_handle, stderr=subprocess.STDOUT, text=True, env=env, start_new_session=True)
+        track_proc(proc)
         started = time.time()
         last_note = 0
-        while proc.poll() is None:
-            time.sleep(2)
-            elapsed = int(time.time() - started)
-            size = (stamp / "config.cf").stat().st_size if (stamp / "config.cf").exists() else 0
-            percent = min(78, 25 + elapsed // 4)
-            if size >= 1048576:
-                amount = f"{size // 1048576} МБ"
-            elif size:
-                amount = f"{max(size // 1024, 1)} КБ"
-            else:
-                amount = "файл ещё пуст"
-            phase = f"конфигуратор выгружает конфигурацию, {elapsed} с, {amount}"
-            progress(percent, phase, phase if elapsed - last_note >= 15 else "")
-            if elapsed - last_note >= 15:
-                last_note = elapsed
-        err_handle.close()
+        try:
+            while proc.poll() is None:
+                if job_stopped(job.get("id", "")):
+                    kill_proc(proc)
+                    raise Stopped("резервное копирование прервано")
+                time.sleep(2)
+                elapsed = int(time.time() - started)
+                size = (stamp / "config.cf").stat().st_size if (stamp / "config.cf").exists() else 0
+                percent = min(78, 25 + elapsed // 4)
+                if size >= 1048576:
+                    amount = f"{size // 1048576} МБ"
+                elif size:
+                    amount = f"{max(size // 1024, 1)} КБ"
+                else:
+                    amount = "файл ещё пуст"
+                phase = f"конфигуратор выгружает конфигурацию, {elapsed} с, {amount}"
+                progress(percent, phase, phase if elapsed - last_note >= 15 else "")
+                if elapsed - last_note >= 15:
+                    last_note = elapsed
+        finally:
+            untrack_proc(proc)
+            err_handle.close()
         output = designer_report(out_file, err_file, xvfb_file)
         code = proc.returncode if proc.returncode is not None else 1
         ready = (stamp / "config.cf").is_file() and (stamp / "config.cf").stat().st_size > 0

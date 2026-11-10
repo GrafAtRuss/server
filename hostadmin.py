@@ -11,7 +11,7 @@ import urllib.request
 from datetime import datetime
 from pathlib import Path
 
-from ops import MOUNT_ROOT, clean_rel, list_vm_names, mount_disk, safe_name
+from ops import MOUNT_ROOT, Stopped, clean_rel, list_vm_names, mount_disk, run_job, safe_name, track_conn, untrack_conn
 
 REPO = "https://github.com/GrafAtRuss/server.git"
 SRC = Path("/opt/onec-console-src")
@@ -832,6 +832,7 @@ def sql_exec(server: dict, query: str, timeout: int = 60) -> str:
                 except TypeError:
                     attempt.pop("autocommit", None)
                     connection = pymssql.connect(**attempt)
+                    track_conn(connection)
                     if hasattr(connection, "autocommit"):
                         connection.autocommit(True)
                 except Exception as error:
@@ -840,6 +841,7 @@ def sql_exec(server: dict, query: str, timeout: int = 60) -> str:
                         continue
                     break
                 try:
+                    track_conn(connection)
                     try:
                         if hasattr(connection, "autocommit"):
                             connection.autocommit(True)
@@ -856,6 +858,7 @@ def sql_exec(server: dict, query: str, timeout: int = 60) -> str:
                         continue
                     break
                 finally:
+                    untrack_conn(connection)
                     connection.close()
     try:
         binary = sqlcmd_path()
@@ -870,7 +873,7 @@ def sql_exec(server: dict, query: str, timeout: int = 60) -> str:
     variants = (["-No", "-C"], ["-C"], [])
     for extra in variants:
         args = [binary, "-S", address, "-U", str(server.get("login", "")), "-b", "-W", "-h-1", "-s|", "-f", "65001", *extra, "-Q", query]
-        result = subprocess.run(args, capture_output=True, timeout=timeout, env=env, check=False)
+        result = run_job(args, capture_output=True, timeout=timeout, env=env)
         text = decode_sql_output(result.stdout)
         err = decode_sql_output(result.stderr)
         last = (err or text).strip()

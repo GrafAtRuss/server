@@ -149,7 +149,7 @@
   <div id="boot" class="login"><p class="muted mono">Открываем консоль…</p></div>
   <form id="login" class="login hidden">
     <div class="card">
-      <p class="eyebrow">1.2.30</p>
+      <p class="eyebrow">1.2.31</p>
       <h1 style="margin-top:12px">Консоль платформы</h1>
       <label class="lbl" for="login-name">Логин</label>
       <input id="login-name" autocomplete="username" style="margin-top:8px" />
@@ -162,7 +162,7 @@
   <div id="app" class="shell hidden">
     <aside>
       <div>
-        <p class="eyebrow" style="color:var(--rail-dim)">1.2.30</p>
+        <p class="eyebrow" style="color:var(--rail-dim)">1.2.31</p>
         <p style="margin:4px 0 0;font-size:18px;font-weight:600">Консоль платформы</p>
       </div>
       <nav class="nav" style="overflow:auto">
@@ -498,7 +498,7 @@
         const details = active
           ? `<div class="meter" data-job-bar="${job.id}"><span style="width:${pct}%"></span></div><p class="muted" data-job-phase="${job.id}">${pct}% · ${esc(job.phase || (job.running ? "запуск" : ""))}</p><pre class="log" data-job-log="${job.id}" style="min-height:0">${esc(shown)}</pre>`
           : "";
-        return `<div${job.running ? ' data-live="1"' : ""}><p>${when} · ${place}${cloud} · хранить ${sched.keepDays ?? 14} дн. <button class="ghost" type="button" data-edit-job="${job.id}">Изменить</button> <button class="ghost" type="button" data-run="${job.id}">${job.running ? "Идёт…" : "Запустить"}</button> <button class="ghost" type="button" data-drop="backup-jobs:${job.id}">Удалить</button></p>${details}</div>`;
+        return `<div${job.running ? ' data-live="1"' : ""}><p>${when} · ${place}${cloud} · хранить ${sched.keepDays ?? 14} дн. <button class="ghost" type="button" data-edit-job="${job.id}">Изменить</button> ${job.running ? `<button class="ghost" type="button" data-stop="${job.id}">Прервать</button>` : `<button class="ghost" type="button" data-run="${job.id}">Запустить</button>`} <button class="ghost" type="button" data-drop="backup-jobs:${job.id}">Удалить</button></p>${details}</div>`;
       };
       const jobForm = (id, kind) => {
         const dayButtons = days.map((label, index) => `<button class="ghost" type="button" data-day="${index}" data-day-for="${id}" data-on="${index < 5 ? "1" : "0"}" style="${index < 5 ? "background:var(--pine);color:#fff" : ""}">${label}</button>`).join("");
@@ -1335,6 +1335,18 @@
         const extra = drop.dataset.kind ? "&kind=" + drop.dataset.kind : "";
         await api("/api/" + kind + "?id=" + encodeURIComponent(id) + extra, { method: "DELETE" });
         await refresh();
+        return;
+      }
+      const stopButton = event.target.closest("[data-stop]");
+      if (stopButton) {
+        event.preventDefault();
+        try {
+          await send("/api/backup-jobs/cancel", { id: stopButton.dataset.stop });
+          $("form-error").textContent = "Прерываю резервное копирование…";
+          await refresh();
+        } catch (error) {
+          $("form-error").textContent = error.message;
+        }
         return;
       }
       const runButton = event.target.closest("[data-run]");

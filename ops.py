@@ -4,8 +4,10 @@ import http.client
 import json
 import os
 import re
+import signal
 import ssl
 import subprocess
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -17,6 +19,112 @@ from xml.sax.saxutils import escape as xml_escape
 
 MOUNT_ROOT = Path(os.environ.get("ONEC_MOUNT_ROOT", "/mnt/onec-console"))
 CTX = ssl._create_unverified_context()
+CANCELLED = set()
+PROCESSES = {}
+CONNECTIONS = {}
+CANCEL_LOCK = threading.Lock()
+CURRENT_JOB = threading.local()
+
+
+class Stopped(Exception):
+    pass
+
+
+def bind_job(job_id: str) -> None:
+    CURRENT_JOB.id = job_id
+    with CANCEL_LOCK:
+        CANCELLED.discard(job_id)
+
+
+def current_job() -> str:
+    return getattr(CURRENT_JOB, "id", "") or ""
+
+
+def job_stopped(job_id: str = "") -> bool:
+    job_id = job_id or current_job()
+    return bool(job_id) and job_id in CANCELLED
+
+
+def track_proc(proc) -> None:
+    job_id = current_job()
+    if not job_id or proc is None:
+        return
+    with CANCEL_LOCK:
+        PROCESSES.setdefault(job_id, []).append(proc)
+
+
+def untrack_proc(proc) -> None:
+    job_id = current_job()
+    with CANCEL_LOCK:
+        rows = PROCESSES.get(job_id, [])
+        if proc in rows:
+            rows.remove(proc)
+
+
+def track_conn(connection) -> None:
+    job_id = current_job()
+    if not job_id or connection is None:
+        return
+    with CANCEL_LOCK:
+        CONNECTIONS.setdefault(job_id, []).append(connection)
+
+
+def untrack_conn(connection) -> None:
+    job_id = current_job()
+    with CANCEL_LOCK:
+        rows = CONNECTIONS.get(job_id, [])
+        if connection in rows:
+            rows.remove(connection)
+
+
+def kill_proc(proc) -> None:
+    if proc is None or proc.poll() is not None:
+        return
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+    except Exception:
+        try:
+            proc.terminate()
+        except Exception:
+            return
+    try:
+        proc.wait(timeout=3)
+    except Exception:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+
+def stop_job(job_id: str) -> None:
+    with CANCEL_LOCK:
+        CANCELLED.add(job_id)
+        procs = list(PROCESSES.get(job_id, []))
+        conns = list(CONNECTIONS.get(job_id, []))
+    for proc in procs:
+        kill_proc(proc)
+    for connection in conns:
+        try:
+            connection.close()
+        except Exception:
+            pass
+
+
+def check_job() -> None:
+    if job_stopped():
+        raise Stopped("резервное копирование прервано")
+
+
+def run_job(args, timeout=None, **kwargs):
+    if kwargs.pop("capture_output", False):
+        kwargs.setdefault("stdout", subprocess.PIPE)
+        kwargs.setdefault("stderr", subprocess.PIPE)
+    kwargs.pop("check", None)
+    proc = subprocess.Popen(args, start_new_session=True, **kwargs)
+    return run_job_proc(proc, timeout)
 
 
 def probe(item: dict) -> tuple[bool, str]:
@@ -378,6 +486,9 @@ def run_vm(job: dict, host: dict, storage: dict, step=None) -> list:
         try:
             control.shutdown(job["vmName"])
             requested_off = True
+        except Stopped:
+            requested_off = True
+            raise
         except Exception as error:
             requested_off = True
             if timed_out(error):
@@ -406,12 +517,14 @@ def run_vm(job: dict, host: dict, storage: dict, step=None) -> list:
             note_path = stamp_dir / "backup.txt"
             note_path.write_text(f"{job['vmName']} off, host {host['host']}\n", encoding="utf-8")
             note(65, "копирование файлов", f"отметка бекапа {note_path}")
-            copied = copy_vm_files(host, job["vmName"], stamp_dir, control, lambda line: note(70, "копирование файлов", line), storage)
+            copied = copy_vm_files(host, job["vmName"], stamp_dir, control, lambda line: note(70, "копирование файлов", line), storage, job.get("id", ""))
             if str(copied).startswith("файлы ВМ записаны"):
                 note(80, "копирование файлов", copied)
             else:
                 failed = copied
                 note(100, "ошибка", copied)
+    except Stopped:
+        raise
     except Exception as error:
         failed = str(error)
         note(100, "ошибка", failed)
@@ -440,7 +553,7 @@ def shell_quote(value: str) -> str:
 
 
 def ssh_exec(host: dict, command: str, timeout: int = 60, stdout=None, stdin=None):
-    return subprocess.run(
+    proc = subprocess.Popen(
         [
             "sshpass", "-p", str(host.get("secret", "")),
             "ssh", "-o", "StrictHostKeyChecking=accept-new",
@@ -451,9 +564,27 @@ def ssh_exec(host: dict, command: str, timeout: int = 60, stdout=None, stdin=Non
         stdout=stdout if stdout is not None else subprocess.PIPE,
         stderr=subprocess.PIPE,
         stdin=stdin,
-        check=False,
-        timeout=timeout,
+        start_new_session=True,
     )
+    return run_job_proc(proc, timeout)
+
+
+def run_job_proc(proc, timeout=None):
+    track_proc(proc)
+    started = time.time()
+    try:
+        while proc.poll() is None:
+            if job_stopped():
+                kill_proc(proc)
+                raise Stopped("резервное копирование прервано")
+            if timeout and time.time() - started > timeout:
+                kill_proc(proc)
+                raise TimeoutError("время команды истекло")
+            time.sleep(0.4)
+        stdout, stderr = proc.communicate()
+        return subprocess.CompletedProcess(proc.args, proc.returncode, stdout, stderr)
+    finally:
+        untrack_proc(proc)
 
 
 def ssh_text(host: dict, command: str, timeout: int = 60) -> tuple[int, str, str]:
@@ -528,7 +659,7 @@ def parse_ds_path(path: str) -> tuple[str, str]:
     return store.strip(), folder
 
 
-def copy_vm_files(host: dict, vm_name: str, folder: Path, control=None, progress=None, storage=None) -> str:
+def copy_vm_files(host: dict, vm_name: str, folder: Path, control=None, progress=None, storage=None, job_id: str = "") -> str:
     if shutil_which("sshpass"):
         try:
             directory = locate_vm_dir(host, vm_name)
@@ -544,7 +675,7 @@ def copy_vm_files(host: dict, vm_name: str, folder: Path, control=None, progress
                 progress(copied)
     if progress:
         progress("это vCenter, скачиваю файлы машины через API")
-    return download_vm_http(host, vm_name, folder, control, progress, storage)
+    return download_vm_http(host, vm_name, folder, control, progress, storage, job_id)
 
 
 def copy_vm_ssh(host: dict, directory: str, folder: Path) -> str:
@@ -569,7 +700,7 @@ def copy_vm_ssh(host: dict, directory: str, folder: Path) -> str:
     return "копия файлов ВМ не удалась: " + (last or "на гипервизоре нет команды tar")
 
 
-def download_vm_http(host: dict, vm_name: str, folder: Path, control=None, progress=None, storage=None) -> str:
+def download_vm_http(host: dict, vm_name: str, folder: Path, control=None, progress=None, storage=None, job_id: str = "") -> str:
     from html import unescape
 
     if control is None:
@@ -640,6 +771,8 @@ def download_vm_http(host: dict, vm_name: str, folder: Path, control=None, progr
                     chunk = response.read(1024 * 1024)
                     if not chunk:
                         break
+                    if job_id and job_stopped(job_id):
+                        raise Stopped("резервное копирование прервано")
                     handle.write(chunk)
                     got += len(chunk)
                     now = time.time()
