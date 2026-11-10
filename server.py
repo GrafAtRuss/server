@@ -38,9 +38,9 @@ from hostadmin import (
     ensure_soname,
     apt_install,
 )
-from ops import MOUNT_ROOT, cache_root, connect_host, deliver, extract_vm_files, locate_copy, locate_vm_dir, list_storage, probe, public_copy, run_vm, schedule_due
+from ops import MOUNT_ROOT, cache_root, connect_host, deliver, extract_vm_files, locate_copy, locate_vm_dir, list_storage, probe, public_copy, run_vm, schedule_due, upload_vm_http
 
-PRODUCT_VERSION = "1.2.28"
+PRODUCT_VERSION = "1.2.29"
 LOGIN_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
 
 STATE_DIR = Path(os.environ.get("ONEC_STATE_DIR", "/var/lib/onec-console"))
@@ -1462,9 +1462,16 @@ def restore_vm_files(host: dict, name: str, folder: Path, note) -> None:
     if not control.wait_off(name):
         raise RuntimeError("машина не выключилась")
     try:
-        directory = locate_vm_dir(host, name)
-        note(f"возвращаю файлы в {directory}")
-        extract_vm_files(host, directory, archive)
+        meta = folder / "vm-source.txt"
+        try:
+            directory = locate_vm_dir(host, name)
+            note(f"возвращаю файлы в {directory}")
+            extract_vm_files(host, directory, archive)
+        except RuntimeError as error:
+            if not meta.is_file():
+                raise
+            note(f"SSH не подошёл ({error}), возвращаю файлы через vCenter")
+            upload_vm_http(host, archive, meta)
     finally:
         control.power_on(name)
         note("машина включается")

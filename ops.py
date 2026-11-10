@@ -406,9 +406,10 @@ def run_vm(job: dict, host: dict, storage: dict, step=None) -> list:
             note_path = stamp_dir / "backup.txt"
             note_path.write_text(f"{job['vmName']} off, host {host['host']}\n", encoding="utf-8")
             note(65, "копирование файлов", f"отметка бекапа {note_path}")
-            copied = copy_vm_files(host, job["vmName"], stamp_dir)
-            note(80, "копирование файлов", copied)
-            if not str(copied).startswith("файлы ВМ записаны"):
+            copied = copy_vm_files(host, job["vmName"], stamp_dir, control, lambda line: note(70, "копирование файлов", line))
+            if str(copied).startswith("файлы ВМ записаны"):
+                note(80, "копирование файлов", copied)
+            else:
                 failed = copied
                 note(100, "ошибка", copied)
     except Exception as error:
@@ -499,13 +500,54 @@ def locate_vm_dir(host: dict, vm_name: str) -> str:
     raise RuntimeError("каталог ВМ на ESXi не найден" + (f": {detail}" if detail else ""))
 
 
-def copy_vm_files(host: dict, vm_name: str, folder: Path) -> str:
-    if not shutil_which("sshpass"):
-        return "файлы ВМ не скопированы: нет sshpass, метка бекапа записана"
-    try:
-        directory = locate_vm_dir(host, vm_name)
-    except RuntimeError as error:
-        return str(error)
+def rows_of(payload) -> list:
+    if isinstance(payload, list):
+        return payload
+    if isinstance(payload, dict):
+        value = payload.get("value", payload)
+        if isinstance(value, list):
+            return value
+        if isinstance(value, dict):
+            return [value]
+    return []
+
+
+def backing_path(backing) -> str:
+    if not isinstance(backing, dict):
+        return ""
+    return str(backing.get("vmdk_file") or backing.get("vmdkFile") or "")
+
+
+def parse_ds_path(path: str) -> tuple[str, str]:
+    text = path.strip()
+    if not (text.startswith("[") and "]" in text):
+        raise RuntimeError(f"непонятный путь хранилища: {text}")
+    store, rest = text[1:].split("]", 1)
+    parent = str(Path(rest.strip()).parent)
+    folder = "" if parent in ("", ".") else parent
+    return store.strip(), folder
+
+
+def copy_vm_files(host: dict, vm_name: str, folder: Path, control=None, progress=None) -> str:
+    if shutil_which("sshpass"):
+        try:
+            directory = locate_vm_dir(host, vm_name)
+        except RuntimeError as error:
+            directory = ""
+            if progress and "vCenter Server" not in str(error):
+                progress(str(error))
+        if directory:
+            copied = copy_vm_ssh(host, directory, folder)
+            if copied.startswith("файлы ВМ записаны"):
+                return copied
+            if progress:
+                progress(copied)
+    if progress:
+        progress("это vCenter, скачиваю файлы машины через API")
+    return download_vm_http(host, vm_name, folder, control, progress)
+
+
+def copy_vm_ssh(host: dict, directory: str, folder: Path) -> str:
     quoted = shell_quote(directory)
     archive = folder / "vm.tar"
     last = ""
@@ -525,6 +567,258 @@ def copy_vm_files(host: dict, vm_name: str, folder: Path) -> str:
     if archive.exists():
         archive.unlink()
     return "копия файлов ВМ не удалась: " + (last or "на гипервизоре нет команды tar")
+
+
+def download_vm_http(host: dict, vm_name: str, folder: Path, control=None, progress=None) -> str:
+    import tarfile
+    from html import unescape
+
+    if control is None:
+        control = connect_host(host)
+    vmdk = ""
+    centers = []
+    if hasattr(control, "disk_path"):
+        try:
+            vmdk = control.disk_path(vm_name)
+        except Exception as error:
+            if progress:
+                progress(f"список дисков: {error}")
+        try:
+            centers = control.datacenters()
+        except Exception:
+            centers = []
+    if not vmdk:
+        vmdk = soap_vm_path(host, vm_name, control)
+    if not vmdk:
+        return "vCenter не сообщил, на каком хранилище лежат файлы машины"
+    datastore, remote_folder = parse_ds_path(vmdk)
+    if not centers:
+        centers = ["Datacenter", "ha-datacenter"]
+    base = getattr(control, "base", "") or api_base(host.get("host", ""))
+    cookie = folder_cookie(host, control)
+    last = ""
+    chosen = ""
+    names = []
+    for dc in centers:
+        try:
+            html = folder_text(base, host, cookie, datastore, dc, remote_folder)
+        except Exception as error:
+            last = str(error)
+            continue
+        found = folder_names(unescape(html), remote_folder)
+        if found:
+            chosen = dc
+            names = found
+            break
+        last = "каталог пуст или это не список файлов"
+    if not names:
+        return f"файлы {vm_name} в хранилище {datastore} не открылись: {last}"
+    (folder / "vm-source.txt").write_text(
+        f"datastore={datastore}\nfolder={remote_folder}\ndc={chosen}\npath={vmdk}\n",
+        encoding="utf-8",
+    )
+    archive = folder / "vm.tar"
+    with tarfile.open(archive, "w") as bundle:
+        for name in names:
+            if progress:
+                progress(f"скачиваю {name}")
+            remote = f"{remote_folder}/{name}" if remote_folder else name
+            url = folder_url(base, datastore, chosen, remote)
+            conn, response = http_open(url, folder_headers(host, cookie), timeout=3600)
+            try:
+                if response.status >= 400:
+                    body = response.read(300).decode("utf-8", "replace")
+                    raise RuntimeError(f"{name}: HTTP {response.status} {body}")
+                length = int(response.getheader("Content-Length") or "0")
+                info = tarfile.TarInfo(name)
+                if length > 0:
+                    info.size = length
+                    bundle.addfile(info, response)
+                else:
+                    temp = folder / f".part-{safe_name(name)}"
+                    with temp.open("wb") as handle:
+                        while True:
+                            chunk = response.read(1024 * 1024)
+                            if not chunk:
+                                break
+                            handle.write(chunk)
+                    info.size = temp.stat().st_size
+                    with temp.open("rb") as handle:
+                        bundle.addfile(info, handle)
+                    temp.unlink(missing_ok=True)
+            finally:
+                conn.close()
+    if not looks_like_tar(archive):
+        return "файлы скачались, но архив пуст"
+    return f"файлы ВМ записаны в {archive}"
+
+
+def soap_vm_path(host: dict, vm_name: str, control=None) -> str:
+    try:
+        soap = control if isinstance(control, SoapHost) else SoapHost.login(
+            getattr(control, "base", "") or api_base(host.get("host", "")),
+            str(host.get("login", "")),
+            str(host.get("secret", "")),
+            str(host.get("kind", "")),
+        )
+    except Exception:
+        return ""
+    try:
+        moref = soap.moref(vm_name)
+    except Exception:
+        return ""
+    payload, _ = soap_call(
+        soap.base,
+        "<urn:RetrieveProperties>"
+        f"<urn:_this type=\"PropertyCollector\">{xml_escape(soap.collector)}</urn:_this>"
+        "<urn:specSet><urn:propSet><urn:type>VirtualMachine</urn:type><urn:pathSet>config.files.vmPathName</urn:pathSet></urn:propSet>"
+        f"<urn:objectSet><urn:obj type=\"VirtualMachine\">{xml_escape(moref)}</urn:obj></urn:objectSet></urn:specSet>"
+        "</urn:RetrieveProperties>",
+        soap.cookie,
+        soap.action,
+        soap.style,
+    )
+    for value in re.findall(r"<(?:\w+:)?val[^>]*>([^<]+)", payload):
+        if value.startswith("[") and ".vm" in value:
+            return value.strip()
+    return ""
+
+
+def folder_cookie(host: dict, control) -> str:
+    if isinstance(control, SoapHost) and control.cookie:
+        return control.cookie.split(";", 1)[0]
+    try:
+        soap = SoapHost.login(
+            getattr(control, "base", "") or api_base(host.get("host", "")),
+            str(host.get("login", "")),
+            str(host.get("secret", "")),
+            str(host.get("kind", "")),
+        )
+        return soap.cookie.split(";", 1)[0]
+    except Exception:
+        return ""
+
+
+def folder_headers(host: dict, cookie: str) -> dict:
+    login = str(host.get("login", ""))
+    secret = str(host.get("secret", ""))
+    token = b64encode(f"{login}:{secret}".encode()).decode()
+    headers = {"Authorization": f"Basic {token}"}
+    if cookie:
+        headers["Cookie"] = cookie
+    return headers
+
+
+def folder_url(base: str, datastore: str, datacenter: str, path: str) -> str:
+    encoded = "/".join(urllib.parse.quote(part) for part in path.split("/") if part)
+    query = urllib.parse.urlencode({"dcPath": datacenter, "dsName": datastore})
+    root = base.rstrip("/") + "/folder"
+    if encoded:
+        root += "/" + encoded
+    return root + "?" + query
+
+
+def folder_text(base: str, host: dict, cookie: str, datastore: str, datacenter: str, path: str) -> str:
+    conn, response = http_open(folder_url(base, datastore, datacenter, path), folder_headers(host, cookie), timeout=60)
+    try:
+        body = response.read(2_000_000)
+        if response.status >= 400:
+            raise RuntimeError(f"HTTP {response.status}")
+    finally:
+        conn.close()
+    return body.decode("utf-8", "replace")
+
+
+def folder_names(html: str, folder: str) -> list:
+    names = []
+    for href, label in re.findall(r'href="([^"]+)"[^>]*>([^<]+)', html, re.I):
+        label = label.strip().rstrip("/")
+        if not label or label in ("..", "Parent Directory", folder):
+            continue
+        if href.rstrip("/").endswith("/" + urllib.parse.quote(label)) is False and label.endswith("/"):
+            continue
+        if "." not in label:
+            continue
+        names.append(label)
+    return list(dict.fromkeys(names))
+
+
+def http_open(url: str, headers: dict, method: str = "GET", timeout: int = 120):
+    current = url
+    for _ in range(6):
+        parts = urllib.parse.urlsplit(current)
+        if parts.scheme == "https":
+            conn = http.client.HTTPSConnection(parts.hostname, parts.port or 443, timeout=timeout, context=CTX)
+        else:
+            conn = http.client.HTTPConnection(parts.hostname, parts.port or 80, timeout=timeout)
+        path = parts.path or "/"
+        if parts.query:
+            path += "?" + parts.query
+        conn.request(method, path, headers=headers)
+        response = conn.getresponse()
+        if response.status in (301, 302, 303, 307, 308):
+            location = response.getheader("Location") or ""
+            response.read()
+            conn.close()
+            if not location:
+                break
+            current = urllib.parse.urljoin(current, location)
+            continue
+        return conn, response
+    raise RuntimeError("слишком много перенаправлений")
+
+
+def upload_vm_http(host: dict, archive: Path, meta_file: Path) -> None:
+    import tarfile
+
+    meta = {}
+    for line in meta_file.read_text(encoding="utf-8").splitlines():
+        if "=" in line:
+            key, value = line.split("=", 1)
+            meta[key] = value
+    datastore = meta.get("datastore", "")
+    remote_folder = meta.get("folder", "")
+    datacenter = meta.get("dc", "") or "Datacenter"
+    if not datastore:
+        raise RuntimeError("в копии нет пути хранилища vCenter")
+    control = connect_host(host)
+    base = getattr(control, "base", "") or api_base(host.get("host", ""))
+    cookie = folder_cookie(host, control)
+    headers = folder_headers(host, cookie)
+    with tarfile.open(archive, "r") as bundle:
+        for member in bundle.getmembers():
+            if not member.isfile():
+                continue
+            payload = bundle.extractfile(member)
+            if payload is None:
+                continue
+            remote = f"{remote_folder}/{member.name}" if remote_folder else member.name
+            url = folder_url(base, datastore, datacenter, remote)
+            put_stream(url, headers, payload, member.size)
+
+
+def put_stream(url: str, headers: dict, payload, size: int) -> None:
+    parts = urllib.parse.urlsplit(url)
+    conn = http.client.HTTPSConnection(parts.hostname, parts.port or 443, timeout=3600, context=CTX)
+    path = parts.path or "/"
+    if parts.query:
+        path += "?" + parts.query
+    conn.putrequest("PUT", path)
+    for key, value in headers.items():
+        conn.putheader(key, value)
+    conn.putheader("Content-Length", str(size))
+    conn.putheader("Content-Type", "application/octet-stream")
+    conn.endheaders()
+    while True:
+        chunk = payload.read(1024 * 1024)
+        if not chunk:
+            break
+        conn.send(chunk)
+    response = conn.getresponse()
+    body = response.read(300).decode("utf-8", "replace")
+    conn.close()
+    if response.status >= 400:
+        raise RuntimeError(f"vCenter не принял файл: HTTP {response.status} {body}")
 
 
 def copy_vm_by_files(host: dict, directory: str, archive: Path) -> bool:
@@ -790,6 +1084,31 @@ class RestHost:
         payload = api(self.base, self.root, self.session, "/vcenter/vm")
         rows = payload.get("value", payload) if isinstance(payload, dict) else payload
         return [row.get("name") for row in rows or [] if isinstance(row, dict) and row.get("name")]
+
+    def disk_path(self, name: str) -> str:
+        if not self.vm_id:
+            self.vm_id = find_vm(self.base, self.root, self.session, name)
+        encoded = urllib.parse.quote(self.vm_id, safe="")
+        payload = api(self.base, self.root, self.session, f"/vcenter/vm/{encoded}/hardware/disk")
+        for row in rows_of(payload):
+            backing = row.get("backing") if isinstance(row, dict) else None
+            path = backing_path(backing)
+            if path:
+                return path
+            disk = row.get("disk") if isinstance(row, dict) else ""
+            if not disk:
+                continue
+            detail = api(self.base, self.root, self.session, f"/vcenter/vm/{encoded}/hardware/disk/{urllib.parse.quote(str(disk), safe='')}")
+            path = backing_path(detail.get("backing") if isinstance(detail, dict) else None)
+            if not path and isinstance(detail, dict):
+                path = backing_path((detail.get("value") or {}).get("backing") if isinstance(detail.get("value"), dict) else None)
+            if path:
+                return path
+        return ""
+
+    def datacenters(self) -> list:
+        payload = api(self.base, self.root, self.session, "/vcenter/datacenter")
+        return [row.get("name") for row in rows_of(payload) if isinstance(row, dict) and row.get("name")]
 
     def shutdown(self, name: str) -> None:
         self.vm_id = find_vm(self.base, self.root, self.session, name)
