@@ -2,7 +2,7 @@
 set -eu
 ROOT=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
 STAGE=$(mktemp -d)
-VERSION=1.2.32
+VERSION=1.2.33
 NAME=onec-console
 DEST="$STAGE/${NAME}_${VERSION}_all"
 OUT=${1:-$ROOT/${NAME}_${VERSION}_all.deb}
@@ -28,8 +28,9 @@ After=network.target
 [Service]
 Type=simple
 ExecStart=/usr/bin/python3 -u /usr/lib/onec-console/server.py
-Restart=on-failure
+Restart=always
 RestartSec=2
+LimitNOFILE=65535
 Environment=ONEC_STATE_DIR=/var/lib/onec-console
 Environment=ONEC_CACHE_DIR=/var/cache/onec-platform
 Environment=ONEC_PASSWORD_FILE=/etc/onec-console/initial-password
@@ -70,7 +71,8 @@ if [ ! -s /var/lib/onec-console/state.json ] && [ ! -s /etc/onec-console/initial
 fi
 if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
   systemctl daemon-reload
-  systemctl enable --now onec-console.service
+  systemctl enable onec-console.service
+  systemctl restart onec-console.service
 else
   echo "onec-console: start it with systemctl enable --now onec-console"
 fi

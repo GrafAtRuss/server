@@ -1,4 +1,4 @@
-# Консоль платформы 1.2.32
+# Консоль платформы 1.2.33
 
 Веб-консоль для Ubuntu 24.04: установка платформы 1С, бекап конфигураций, диски и облака, бекап виртуальных машин ESXi и vSphere.
 
@@ -12,7 +12,7 @@ sudo apt-get install -y git python3 cifs-utils nfs-common sshpass
 git clone https://github.com/GrafAtRuss/server.git
 cd server
 sudo ./build-deb.sh
-sudo dpkg -i onec-console_1.2.32_all.deb
+sudo dpkg -i onec-console_1.2.33_all.deb
 sudo cat /etc/onec-console/initial-password
 ```
 
@@ -30,7 +30,7 @@ sudo ufw allow 8780/tcp
 cd server
 git pull
 sudo ./build-deb.sh
-sudo dpkg -i onec-console_1.2.32_all.deb
+sudo dpkg -i onec-console_1.2.33_all.deb
 ```
 
 Пароль при обновлении не сбрасывается.

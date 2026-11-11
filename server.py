@@ -40,7 +40,7 @@ from hostadmin import (
 )
 from ops import MOUNT_ROOT, Stopped, bind_job, cache_root, check_job, connect_host, deliver, extract_vm_files, job_stopped, kill_proc, locate_copy, locate_vm_dir, list_storage, probe, public_copy, run_vm, schedule_due, stop_job, track_proc, untrack_proc, upload_vm_http
 
-PRODUCT_VERSION = "1.2.32"
+PRODUCT_VERSION = "1.2.33"
 LOGIN_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
 
 STATE_DIR = Path(os.environ.get("ONEC_STATE_DIR", "/var/lib/onec-console"))
@@ -105,7 +105,16 @@ def load_state() -> dict:
     path = STATE_DIR / "state.json"
     if not path.exists():
         return blank_state()
-    state = json.loads(path.read_text(encoding="utf-8"))
+    try:
+        state = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        bak = STATE_DIR / "state.json.bak"
+        try:
+            state = json.loads(bak.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            raise RuntimeError(f"файл состояния не читается: {error}") from error
+    if not isinstance(state, dict):
+        raise RuntimeError("файл состояния повреждён")
     for key, value in blank_state().items():
         state.setdefault(key, value)
     return state
@@ -114,10 +123,23 @@ def load_state() -> dict:
 def save_state(state: dict) -> None:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     target = STATE_DIR / "state.json"
-    temporary = STATE_DIR / "state.json.tmp"
-    temporary.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
-    os.chmod(temporary, 0o600)
-    temporary.replace(target)
+    temporary = STATE_DIR / f"state.json.{secrets.token_hex(4)}.tmp"
+    payload = json.dumps(state, ensure_ascii=False, indent=2)
+    try:
+        temporary.write_text(payload, encoding="utf-8")
+        os.chmod(temporary, 0o600)
+        if target.is_file():
+            bak = STATE_DIR / "state.json.bak"
+            try:
+                bak.write_bytes(target.read_bytes())
+            except OSError:
+                pass
+        temporary.replace(target)
+    except OSError as error:
+        temporary.unlink(missing_ok=True)
+        if error.errno == 28:
+            raise RuntimeError("диск заполнен, сессия не записана. Освободите место в /var") from error
+        raise RuntimeError(f"не удалось записать состояние: {error.strerror}") from error
 
 
 def ensure_admin() -> None:
@@ -226,6 +248,16 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt: str, *args) -> None:
         return
 
+    def _fail(self, error: Exception) -> None:
+        import traceback
+
+        traceback.print_exc()
+        text = str(error).strip() or error.__class__.__name__
+        try:
+            self._send(500, {"error": text})
+        except Exception:
+            pass
+
     def _session_user(self, state: dict):
         cookie = self.headers.get("Cookie", "")
         token = ""
@@ -268,7 +300,16 @@ class Handler(BaseHTTPRequestHandler):
         return user
 
     def do_GET(self) -> None:
+        try:
+            self._do_GET()
+        except Exception as error:
+            self._fail(error)
+
+    def _do_GET(self) -> None:
         path = urlparse(self.path).path
+        if path == "/api/health":
+            self._send(200, {"ok": True, "version": PRODUCT_VERSION})
+            return
         if path == "/":
             page = (HERE / "index.html").read_bytes()
             self._send(200, page, "text/html; charset=utf-8")
@@ -287,10 +328,10 @@ class Handler(BaseHTTPRequestHandler):
                 {"login": item["login"], "name": item["name"], "mustChange": item["mustChange"], "blocked": bool(item.get("blocked"))}
                 for item in state["users"]
             ]
-            archives = {
-                kind: {"fileName": slot["fileName"], "count": len(slot["packages"])}
-                for kind, slot in state["archives"].items()
-            }
+            archives = {}
+            for kind, slot in (state.get("archives") or {}).items():
+                if isinstance(slot, dict):
+                    archives[kind] = {"fileName": slot.get("fileName") or "", "count": len(slot.get("packages") or [])}
             self._send(
                 200,
                 {
@@ -312,11 +353,13 @@ class Handler(BaseHTTPRequestHandler):
                     "chosenSql": state["chosenSql"],
                     "backupJobs": [
                         {key: value for key, value in item.items() if key != "baseSecret"}
-                        for item in state["backupJobs"]
+                        for item in state.get("backupJobs") or []
+                        if isinstance(item, dict)
                     ],
                     "copies": [
                         {key: value for key, value in item.items() if key != "baseSecret"}
-                        for item in state.get("copies", [])
+                        for item in state.get("copies") or []
+                        if isinstance(item, dict)
                     ],
                 },
             )
@@ -360,6 +403,12 @@ class Handler(BaseHTTPRequestHandler):
         self._send(404, {"error": "Не найдено."})
 
     def do_POST(self) -> None:
+        try:
+            self._do_POST()
+        except Exception as error:
+            self._fail(error)
+
+    def _do_POST(self) -> None:
         path = urlparse(self.path).path
         if path == "/api/login":
             self._login()
@@ -459,6 +508,12 @@ class Handler(BaseHTTPRequestHandler):
         self._send(404, {"error": "Не найдено."})
 
     def do_DELETE(self) -> None:
+        try:
+            self._do_DELETE()
+        except Exception as error:
+            self._fail(error)
+
+    def _do_DELETE(self) -> None:
         parsed = urlparse(self.path)
         with LOCK:
             state = load_state()
@@ -533,8 +588,10 @@ class Handler(BaseHTTPRequestHandler):
         password = str(payload.get("password", ""))
         with LOCK:
             state = load_state()
-            found = next((item for item in state["users"] if item["login"] == login), None)
-            if not found or found["passHash"] != pbkdf2(password, found["salt"]):
+            found = next((item for item in state["users"] if isinstance(item, dict) and item.get("login") == login), None)
+            salt = str((found or {}).get("salt") or "")
+            stored = str((found or {}).get("passHash") or "")
+            if not found or not salt or stored != pbkdf2(password, salt):
                 self._send(401, {"error": "Неверный логин или пароль."})
                 return
             if found.get("blocked"):

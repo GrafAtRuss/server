@@ -160,7 +160,7 @@
   <div id="boot" class="login"><p class="muted mono">Открываем консоль…</p></div>
   <form id="login" class="login hidden">
     <div class="card">
-      <p class="eyebrow">1.2.32</p>
+      <p class="eyebrow">1.2.33</p>
       <h1 style="margin-top:12px">Консоль платформы</h1>
       <label class="lbl" for="login-name">Логин</label>
       <input id="login-name" autocomplete="username" style="margin-top:8px" />
@@ -173,7 +173,7 @@
   <div id="app" class="shell hidden">
     <aside>
       <div>
-        <p class="eyebrow" style="color:var(--rail-dim)">1.2.32</p>
+        <p class="eyebrow" style="color:var(--rail-dim)">1.2.33</p>
         <p style="margin:4px 0 0;font-size:18px;font-weight:600">Консоль платформы</p>
       </div>
       <nav class="nav" style="overflow:auto">
@@ -448,7 +448,12 @@
     let me = null;
 
     async function api(url, options) {
-      const response = await fetch(url, { credentials: "same-origin", cache: "no-store", ...options });
+      let response;
+      try {
+        response = await fetch(url, { credentials: "same-origin", cache: "no-store", ...options });
+      } catch (error) {
+        throw new Error("Нет связи с панелью. На сервере выполните systemctl restart onec-console и откройте http://адрес:8780 заново.");
+      }
       const data = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(data.error || "Ошибка запроса");
       return data;

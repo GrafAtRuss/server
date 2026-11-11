@@ -205,7 +205,11 @@ def split_host(endpoint: str, default_port: int) -> tuple[str, int]:
 
 def public_copy(items: list) -> list:
     hidden = {"secret", "fileSecret"}
-    return [{key: value for key, value in item.items() if key not in hidden} for item in items]
+    rows = []
+    for item in items or []:
+        if isinstance(item, dict):
+            rows.append({key: value for key, value in item.items() if key not in hidden})
+    return rows
 
 
 def clean_rel(path: str) -> str:
