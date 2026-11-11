@@ -4,6 +4,7 @@ import http.client
 import json
 import os
 import re
+import shutil
 import signal
 import ssl
 import subprocess
@@ -1855,6 +1856,29 @@ def schedule_due(schedule: dict, now: datetime, last_slot: str) -> bool:
 
 def cache_root() -> Path:
     return Path(os.environ.get("ONEC_CACHE_DIR", "/var/cache/onec-platform"))
+
+
+def drop_cache(path: Path) -> str:
+    root = cache_root().resolve()
+    try:
+        target = path.resolve()
+    except OSError:
+        return ""
+    if not str(target).startswith(str(root) + os.sep):
+        return ""
+    if not target.exists():
+        return ""
+    shutil.rmtree(target, ignore_errors=True)
+    return "локальный кэш удалён"
+
+
+def clear_job_cache() -> None:
+    root = cache_root()
+    for name in ("stage", "restore"):
+        folder = root / name
+        if folder.is_dir():
+            shutil.rmtree(folder, ignore_errors=True)
+        folder.mkdir(parents=True, exist_ok=True)
 
 
 def locate_copy(storage: dict, rel: str) -> Path:

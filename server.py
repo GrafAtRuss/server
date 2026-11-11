@@ -38,9 +38,9 @@ from hostadmin import (
     ensure_soname,
     apt_install,
 )
-from ops import MOUNT_ROOT, Stopped, bind_job, cache_root, check_job, connect_host, deliver, extract_vm_files, job_stopped, kill_proc, locate_copy, locate_vm_dir, list_storage, probe, public_copy, run_vm, schedule_due, stop_job, track_proc, untrack_proc, upload_vm_http
+from ops import MOUNT_ROOT, Stopped, bind_job, cache_root, check_job, clear_job_cache, connect_host, deliver, drop_cache, extract_vm_files, job_stopped, kill_proc, locate_copy, locate_vm_dir, list_storage, probe, public_copy, run_vm, schedule_due, stop_job, track_proc, untrack_proc, upload_vm_http
 
-PRODUCT_VERSION = "1.2.33"
+PRODUCT_VERSION = "1.2.34"
 LOGIN_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
 
 STATE_DIR = Path(os.environ.get("ONEC_STATE_DIR", "/var/lib/onec-console"))
@@ -1476,32 +1476,37 @@ def restore_saved(copy_id: str) -> None:
         raise RuntimeError("хранилище копии не найдено")
     push_copy(copy_id, "ищу файлы копии")
     folder = locate_copy(storage, copy.get("rel", ""))
-    kind = copy.get("kind")
-    if kind == "sql":
-        server = next((item for item in state["sqlServers"] if item["id"] == copy.get("sourceId")), None)
-        bak = next((path for path in folder.glob("*.bak") if path.is_file()), None)
-        if not server or not bak:
-            raise RuntimeError("нет сервера SQL или файла bak")
-        push_copy(copy_id, f"восстанавливаю {copy['name']} из {bak.name}")
-        push_copy(copy_id, sql_restore(server, copy["name"], storage, bak))
-        return
-    if kind == "vm":
-        host = next((item for item in state["hosts"] if item["id"] == copy.get("sourceId")), None)
-        if not host or not (folder / "vm.tar").is_file():
-            raise RuntimeError("нет гипервизора или файла vm.tar")
-        restore_vm_files(host, copy["name"], folder, lambda line: push_copy(copy_id, line))
-        return
-    cluster = next((item for item in state["clusters"] if item["id"] == copy.get("sourceId")), None)
-    config = folder / "config.cf"
-    binary = (state.get("installed") or {}).get("binary")
-    if not cluster or not binary or not config.is_file() or config.stat().st_size == 0:
-        raise RuntimeError("нет кластера, платформы или файла конфигурации")
-    push_copy(copy_id, f"загружаю конфигурацию в {copy['name']}")
-    code, output = load_config(binary, cluster, f"{cluster['host']}\\{copy['name']}", config, copy)
-    if output:
-        push_copy(copy_id, output[-500:])
-    if code != 0:
-        raise RuntimeError(output or "конфигуратор не восстановил базу")
+    try:
+        kind = copy.get("kind")
+        if kind == "sql":
+            server = next((item for item in state["sqlServers"] if item["id"] == copy.get("sourceId")), None)
+            bak = next((path for path in folder.glob("*.bak") if path.is_file()), None)
+            if not server or not bak:
+                raise RuntimeError("нет сервера SQL или файла bak")
+            push_copy(copy_id, f"восстанавливаю {copy['name']} из {bak.name}")
+            push_copy(copy_id, sql_restore(server, copy["name"], storage, bak))
+            return
+        if kind == "vm":
+            host = next((item for item in state["hosts"] if item["id"] == copy.get("sourceId")), None)
+            if not host or not (folder / "vm.tar").is_file() and not any(folder.glob("*.vmdk")):
+                raise RuntimeError("нет гипервизора или файлов машины")
+            restore_vm_files(host, copy["name"], folder, lambda line: push_copy(copy_id, line))
+            return
+        cluster = next((item for item in state["clusters"] if item["id"] == copy.get("sourceId")), None)
+        config = folder / "config.cf"
+        binary = (state.get("installed") or {}).get("binary")
+        if not cluster or not binary or not config.is_file() or config.stat().st_size == 0:
+            raise RuntimeError("нет кластера, платформы или файла конфигурации")
+        push_copy(copy_id, f"загружаю конфигурацию в {copy['name']}")
+        code, output = load_config(binary, cluster, f"{cluster['host']}\\{copy['name']}", config, copy)
+        if output:
+            push_copy(copy_id, output[-500:])
+        if code != 0:
+            raise RuntimeError(output or "конфигуратор не восстановил базу")
+    finally:
+        removed = drop_cache(folder)
+        if removed:
+            push_copy(copy_id, removed)
 
 
 def load_config(binary: str, cluster: dict, target: str, config: Path, copy: dict) -> tuple:
@@ -1572,6 +1577,10 @@ def perform_backup(state: dict, job: dict) -> list:
     folder = job.get("folder") or ""
     chosen_name = ""
     source_id = ""
+    stamp = None
+    parent = None
+    delivered = False
+    failed = False
     progress(5, "подготовка", "запуск резервного копирования")
     try:
         if job["kind"] == "vm":
@@ -1639,29 +1648,47 @@ def perform_backup(state: dict, job: dict) -> list:
                 progress(18, "проверяю библиотеки клиента", ensure_onec_runtime())
                 code, output = dump_config(binary, cluster, target, stamp, progress, job)
                 if code != 0:
+                    failed = True
                     progress(100, "ошибка", output or "конфигуратор завершился с ошибкой")
-                    return lines
-                progress(82, "конфигурация выгружена", f"бекап {target} → {stamp}")
+                else:
+                    progress(82, "конфигурация выгружена", f"бекап {target} → {stamp}")
+    except Stopped:
+        failed = True
+        if stamp is not None and storage.get("kind") not in ("cifs", "nfs"):
+            drop_cache(stamp)
+        raise
     except Exception as error:
+        failed = True
         progress(100, "ошибка", str(error))
+    if failed:
+        if stamp is not None and storage.get("kind") not in ("cifs", "nfs"):
+            drop_cache(stamp)
         return lines
-    if stamp.is_dir() and any(stamp.iterdir()):
+    if stamp and stamp.is_dir() and any(stamp.iterdir()):
         progress(86, "сохраняю в хранилище", "переношу файлы в хранилище")
         if (stamp / ".uploaded").is_file():
+            delivered = True
             progress(90, "файлы в хранилище", "файлы уже в хранилище")
         elif storage.get("kind") not in ("cifs", "nfs"):
             rel = copy_rel(storage, stamp)
             parent_rel = "" if rel == stamp.name else str(Path(rel).parent)
-            progress(90, "сохраняю в хранилище", deliver(storage, parent_rel, stamp))
+            result = deliver(storage, parent_rel, stamp)
+            delivered = not str(result).startswith("копия не ушла") and "не отправлена" not in str(result)
+            progress(90, "сохраняю в хранилище", result)
         else:
             progress(90, "файлы на диске", f"папка {stamp}")
-        remember_copy(job, storage, stamp, chosen_name, source_id)
+        if delivered or storage.get("kind") in ("cifs", "nfs"):
+            remember_copy(job, storage, stamp, chosen_name, source_id)
         copies = job.get("copyIds") or []
         for index, cloud_id in enumerate(copies):
             cloud = next((item for item in state["storages"] if item["id"] == cloud_id and item.get("role") == "cloud"), None)
             if cloud:
                 progress(92 + index, f"копия в {cloud.get('name', 'облако')}", f"копирую в {cloud.get('name', 'облако')}")
                 progress(93 + index, f"копия в {cloud.get('name', 'облако')}", deliver(cloud, job.get("cloudFolder") or folder, stamp))
+        if storage.get("kind") not in ("cifs", "nfs") and delivered:
+            removed_cache = drop_cache(stamp)
+            if removed_cache:
+                progress(94, "кэш удалён", removed_cache)
     progress(96, "проверяю срок хранения", "удаляю копии старше срока")
     removed = prune(parent, keep)
     if removed:
@@ -1860,6 +1887,7 @@ def scheduler() -> None:
 def main() -> None:
     ensure_admin()
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    clear_job_cache()
     threading.Thread(target=scheduler, daemon=True).start()
     server = ThreadingHTTPServer((HOST, PORT), Handler)
     server.serve_forever()
